@@ -35,6 +35,7 @@ A Swiper-based infinite loop carousel component with thumbnail drag navigation, 
 - **Paginated Loading** - Built-in `usePaginatedImages` hook, auto-loads on scroll near end
 - **Internationalization** - Built-in Chinese/English, supports custom overrides
 - **Controlled/Uncontrolled** - Both open modes for flexible integration
+- **Settings Persistence** - View mode, thumbnail density, and wheel action can optionally persist to localStorage
 
 ## Installation
 
@@ -160,6 +161,18 @@ import { CarouselI18nProvider } from "@lehuan/swiper-loop-carousel";
 </CarouselI18nProvider>
 ```
 
+### Settings Persistence
+
+When enabled, view mode, thumbnail density, and wheel action are saved to browser localStorage. Closing and reopening the component (or opening another instance) will reuse the same settings.
+
+```tsx
+// Use default storage key (shared across all instances)
+<SwiperLoopCarousel images={images} persistSettings />
+
+// Use custom storage key (isolate or share as needed)
+<SwiperLoopCarousel images={images} persistSettings="my-gallery-settings" />
+```
+
 ## API
 
 ### SwiperLoopCarousel Props
@@ -178,6 +191,7 @@ import { CarouselI18nProvider } from "@lehuan/swiper-loop-carousel";
 | `extraToolbarItems` | `ReactNode` | - | Extra items appended to the right of the default toolbar |
 | `extraOverlayContent` | `(props) => ReactNode` | - | Extra content appended to the overlay area |
 | `onDownload` | `(index: number) => void` | - | Download callback; shows download button when provided |
+| `persistSettings` | `boolean \| string` | `undefined` | Persist settings to localStorage. `true` uses default key, `string` uses custom key, `undefined`/`false` disables |
 
 ### GalleryImage
 

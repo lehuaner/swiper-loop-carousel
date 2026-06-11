@@ -53,6 +53,33 @@ import { useCarouselI18n, useCarouselLang } from "./i18n";
 import AnimatedSlideImg from "./AnimatedSlideImg";
 import HintBar from "./HintBar";
 
+// ── localStorage 持久化 ──
+const DEFAULT_PERSIST_KEY = "@lehuan/swiper-loop-carousel/settings";
+
+interface PersistedSettings {
+  viewMode: 1 | 2 | 3;
+  stripDensityLevel: 1 | 2 | 3;
+  wheelMode: "zoom" | "switch";
+}
+
+function loadPersistedSettings(key: string): PersistedSettings | null {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    return JSON.parse(raw) as PersistedSettings;
+  } catch {
+    return null;
+  }
+}
+
+function savePersistedSettings(key: string, settings: PersistedSettings): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(settings));
+  } catch {
+    // localStorage 可能不可用或已满，安全忽略
+  }
+}
+
 // ── Memoized 子组件 ──
 
 // AnimatedSlideImg：忽略 onExitComplete（内部已用 ref 追踪），避免父组件渲染导致不必要的子组件重渲染
@@ -174,6 +201,7 @@ function SwiperLoopCarousel({
   onClose,
   onDownload,
   total: totalProp,
+  persistSettings,
 }: {
   images: GalleryImage[];
   onNeedMore?: () => void;
@@ -206,6 +234,12 @@ function SwiperLoopCarousel({
   onDownload?: (index: number) => void;
   /** 图片总数（含未加载）。用于覆盖层显示 "3/10000"，默认取 images.length */
   total?: number;
+  /** 是否将设置（视图模式、缩略图密度、滚轮功能）持久化到 localStorage。
+   *  - true：使用默认存储键
+   *  - string：使用自定义存储键（不同组件可共享或隔离配置）
+   *  - undefined / false：不持久化（每次打开重置为默认值）
+   */
+  persistSettings?: boolean | string;
 }) {
   const t = useCarouselI18n();
   const lang = useCarouselLang();
@@ -213,14 +247,22 @@ function SwiperLoopCarousel({
   const isControlled = isOpenProp !== undefined;
   const isOpen = isControlled ? isOpenProp : activeId !== null;
   const [realIndex, setRealIndex] = useState(0);
-  const [viewMode, setViewMode] = useState<1 | 2 | 3>(1);
+  const [viewMode, setViewMode] = useState<1 | 2 | 3>(() => {
+    if (!persistSettings) return 1;
+    const s = loadPersistedSettings(typeof persistSettings === "string" ? persistSettings : DEFAULT_PERSIST_KEY);
+    return s?.viewMode ?? 1;
+  });
   const [viewModeEpoch, setViewModeEpoch] = useState(0);
   const swiperRef = useRef<SwiperClass | null>(null);
   const initialLoadRef = useRef(false);
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const [isStripDragging, setIsStripDragging] = useState(false);
   const [dragMoved, setDragMoved] = useState(false);
-  const [stripDensityLevel, setStripDensityLevel] = useState<1 | 2 | 3>(3);
+  const [stripDensityLevel, setStripDensityLevel] = useState<1 | 2 | 3>(() => {
+    if (!persistSettings) return 3;
+    const s = loadPersistedSettings(typeof persistSettings === "string" ? persistSettings : DEFAULT_PERSIST_KEY);
+    return s?.stripDensityLevel ?? 3;
+  });
   const [isKeyboardActive, setIsKeyboardActive] = useState(false);
   const isKeyboardActiveRef = useRef(false);
   useEffect(() => { isKeyboardActiveRef.current = isKeyboardActive; }, [isKeyboardActive]);
@@ -253,7 +295,11 @@ function SwiperLoopCarousel({
   const prevViewModeRef = useRef<1 | 2 | 3>(1);
   const [containerWidth, setContainerWidth] = useState(0);
   const [containerHeight, setContainerHeight] = useState(0);
-  const [wheelMode, setWheelMode] = useState<"zoom" | "switch">("zoom");
+  const [wheelMode, setWheelMode] = useState<"zoom" | "switch">(() => {
+    if (!persistSettings) return "zoom";
+    const s = loadPersistedSettings(typeof persistSettings === "string" ? persistSettings : DEFAULT_PERSIST_KEY);
+    return s?.wheelMode ?? "zoom";
+  });
   const wheelModeRef = useRef(wheelMode);
   useEffect(() => { wheelModeRef.current = wheelMode; }, [wheelMode]);
   const [openMenu, setOpenMenu] = useState<string | null>(null);
@@ -270,6 +316,13 @@ function SwiperLoopCarousel({
       document.removeEventListener("touchstart", handler, true);
     };
   }, [openMenu]);
+
+  // 持久化设置到 localStorage
+  useEffect(() => {
+    if (!persistSettings) return;
+    const key = typeof persistSettings === "string" ? persistSettings : DEFAULT_PERSIST_KEY;
+    savePersistedSettings(key, { viewMode, stripDensityLevel, wheelMode });
+  }, [persistSettings, viewMode, stripDensityLevel, wheelMode]);
 
   const lastDragTimeRef = useRef(0);
   // 标记 handleUp 是否执行了拖拽导航，用于抑制紧随其后的缩略图 click
@@ -594,11 +647,19 @@ function SwiperLoopCarousel({
 
   const open = useCallback(
     (id: number) => {
-      const idx = images.findIndex((i) => i.id === id);
+      let idx = images.findIndex((i) => i.id === id);
+      let targetId = id;
       setIsKeyboardActive(false);
       setIsStripDragging(false);
       setDragMoved(false);
       if (idx >= 0) {
+        const vm = viewModeRef.current;
+        // 少量图片边界处理：当点击的图片后面不足以填满视图模式时，以更早的图片为基准
+        if (idx + vm > n) {
+          idx = Math.max(0, n - vm);
+        }
+        targetId = images[idx].id;
+
         preloader.preload([idx]);
 
         const w = window.innerWidth;
@@ -606,7 +667,8 @@ function SwiperLoopCarousel({
         const initialStripWidth =
           wideCount * THUMB_SIZE + (wideCount - 1) * THUMB_GAP;
         const initialBaseX = (initialStripWidth - THUMB_SIZE) / 2;
-        const initialTargetX = initialBaseX - idx * (THUMB_SIZE + THUMB_GAP);
+        // 根据 viewMode 偏移缩略图条位置，使高亮框内的图片组居中
+        const initialTargetX = initialBaseX - (idx + (vm - 1) / 2) * (THUMB_SIZE + THUMB_GAP) - (vm === 2 ? DUAL_HIGHLIGHT_EXTRA_GAP / 2 : 0);
         stripX.set(initialTargetX);
         setPendingRealIndex(idx);
         pendingRealIndexRef.current = idx;
@@ -615,7 +677,7 @@ function SwiperLoopCarousel({
         // 同步到 preViewModeIndexRef，防止视图模式变化的 useEffect 读到默认值 0 而覆盖位置
         preViewModeIndexRef.current = idx;
       }
-      setActiveId((prev) => (prev === id ? prev : id));
+      setActiveId((prev) => (prev === targetId ? prev : targetId));
 
       // 每次打开都同步 prevViewModeRef，避免残留
       prevViewModeRef.current = viewModeRef.current;
@@ -1654,7 +1716,7 @@ function SwiperLoopCarousel({
               slidesPerView={viewMode}
               spaceBetween={viewMode > 1 ? 8 : 2}
               loop={!useVirtual && !hasMore && n > viewMode}
-              initialSlide={activeIndex}
+              initialSlide={activeIndex >= 0 ? activeIndex : (initialIndex ?? 0)}
               speed={400}
               onSwiper={handleSwiperInit}
               onSlideChange={handleSlideChange}
@@ -2040,6 +2102,7 @@ export default function SwiperLoopCarouselWithErrorBoundary({
   onClose,
   onDownload,
   total,
+  persistSettings,
 }: {
   images: GalleryImage[];
   onNeedMore?: () => void;
@@ -2068,10 +2131,16 @@ export default function SwiperLoopCarouselWithErrorBoundary({
   onDownload?: (index: number) => void;
   /** 图片总数（含未加载）。用于覆盖层显示 "3/10000"，默认取 images.length */
   total?: number;
+  /** 是否将设置（视图模式、缩略图密度、滚轮功能）持久化到 localStorage。
+   *  - true：使用默认存储键
+   *  - string：使用自定义存储键（不同组件可共享或隔离配置）
+   *  - undefined / false：不持久化（每次打开重置为默认值）
+   */
+  persistSettings?: boolean | string;
 }) {
   return (
     <CarouselErrorBoundary>
-      <SwiperLoopCarousel images={images} onNeedMore={onNeedMore} hasMore={hasMore} renderOverlay={renderOverlay} renderToolbar={renderToolbar} extraToolbarItems={extraToolbarItems} extraOverlayContent={extraOverlayContent} isOpen={isOpen} initialIndex={initialIndex} onClose={onClose} onDownload={onDownload} total={total} />
+      <SwiperLoopCarousel images={images} onNeedMore={onNeedMore} hasMore={hasMore} renderOverlay={renderOverlay} renderToolbar={renderToolbar} extraToolbarItems={extraToolbarItems} extraOverlayContent={extraOverlayContent} isOpen={isOpen} initialIndex={initialIndex} onClose={onClose} onDownload={onDownload} total={total} persistSettings={persistSettings} />
     </CarouselErrorBoundary>
   );
 }

@@ -37,6 +37,7 @@
 - **分页加载** - 内置 `usePaginatedImages` hook，滑动到末尾自动加载
 - **国际化** - 内置中/英文，支持自定义覆盖
 - **受控/非受控** - 两种打开模式，灵活集成
+- **设置持久化** - 视图模式、缩略图密度、滚轮功能可选持久化到 localStorage
 
 ## 安装
 
@@ -162,6 +163,18 @@ import { CarouselI18nProvider } from "@lehuan/swiper-loop-carousel";
 </CarouselI18nProvider>
 ```
 
+### 设置持久化
+
+开启后，视图模式、缩略图密度、滚轮功能会保存到浏览器 localStorage，关闭组件后重新打开（或打开其他相同组件）会复用同一套配置。
+
+```tsx
+// 使用默认存储键（所有实例共享配置）
+<SwiperLoopCarousel images={images} persistSettings />
+
+// 使用自定义存储键（可按需隔离或共享）
+<SwiperLoopCarousel images={images} persistSettings="my-gallery-settings" />
+```
+
 ## API
 
 ### SwiperLoopCarousel Props
@@ -180,6 +193,7 @@ import { CarouselI18nProvider } from "@lehuan/swiper-loop-carousel";
 | `extraToolbarItems` | `ReactNode` | - | 追加到默认工具栏右侧的额外内容 |
 | `extraOverlayContent` | `(props) => ReactNode` | - | 追加到覆盖层区域的额外内容 |
 | `onDownload` | `(index: number) => void` | - | 下载回调，传入后覆盖层显示下载按钮 |
+| `persistSettings` | `boolean \| string` | `undefined` | 是否持久化设置到 localStorage。`true` 使用默认存储键，`string` 使用自定义存储键，`undefined`/`false` 不持久化 |
 
 ### GalleryImage
 
