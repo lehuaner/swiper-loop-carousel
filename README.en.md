@@ -2,6 +2,7 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@lehuan/swiper-loop-carousel"><img src="https://img.shields.io/npm/v/@lehuan/swiper-loop-carousel?style=flat-square&logo=npm" alt="npm version" /></a>
+  <a href="https://github.com/lehuaner/swiper-loop-carousel/releases"><img src="https://img.shields.io/github/v/release/lehuaner/swiper-loop-carousel?style=flat-square&logo=github" alt="GitHub release" /></a>
   <a href="https://github.com/lehuaner/swiper-loop-carousel"><img src="https://img.shields.io/github/stars/lehuaner/swiper-loop-carousel?style=flat-square&logo=github" alt="GitHub stars" /></a>
   <a href="https://github.com/lehuaner/swiper-loop-carousel/blob/master/LICENSE"><img src="https://img.shields.io/npm/l/@lehuan/swiper-loop-carousel?style=flat-square" alt="License" /></a>
   <a href="https://www.npmjs.com/package/@lehuan/swiper-loop-carousel"><img src="https://img.shields.io/npm/dm/@lehuan/swiper-loop-carousel?style=flat-square" alt="npm downloads" /></a>
