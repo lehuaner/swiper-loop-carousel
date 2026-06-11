@@ -26,7 +26,8 @@
   ],
   "scripts": {
     "build": "tsup",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "release": "npm version patch && git push --follow-tags"
   },
   "peerDependencies": {
     "motion": "^11.0.0 || ^12.0.0",
@@ -63,6 +64,10 @@
   "author": "lehuan",
   "repository": {
     "type": "git",
-    "url": ""
-  }
+    "url": "git+https://github.com/lehuaner/swiper-loop-carousel.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lehuaner/swiper-loop-carousel/issues"
+  },
+  "homepage": "https://github.com/lehuaner/swiper-loop-carousel#readme"
 }

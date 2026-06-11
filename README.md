@@ -1,8 +1,20 @@
 # @lehuan/swiper-loop-carousel
 
+<p align="center">
+  <a href="https://www.npmjs.com/package/@lehuan/swiper-loop-carousel"><img src="https://img.shields.io/npm/v/@lehuan/swiper-loop-carousel?style=flat-square&logo=npm" alt="npm version" /></a>
+  <a href="https://github.com/lehuaner/swiper-loop-carousel"><img src="https://img.shields.io/github/stars/lehuaner/swiper-loop-carousel?style=flat-square&logo=github" alt="GitHub stars" /></a>
+  <a href="https://github.com/lehuaner/swiper-loop-carousel/blob/master/LICENSE"><img src="https://img.shields.io/npm/l/@lehuan/swiper-loop-carousel?style=flat-square" alt="License" /></a>
+  <a href="https://www.npmjs.com/package/@lehuan/swiper-loop-carousel"><img src="https://img.shields.io/npm/dm/@lehuan/swiper-loop-carousel?style=flat-square" alt="npm downloads" /></a>
+  <img src="https://img.shields.io/badge/react-18%20%7C%2019-61DAFB?style=flat-square&logo=react" alt="React" />
+  <img src="https://img.shields.io/badge/swiper-%5E12-6332F6?style=flat-square&logo=swiper" alt="Swiper" />
+</p>
+
 基于 Swiper 的无限循环轮播组件，支持缩略图拖拽导航、键盘长按快速预览、滚轮/双指缩放、多视图模式切换。
 
 针对万级图片量做了深度性能优化：Swiper Virtual 虚拟化、缩略图条虚拟化、增量缓存、内存自动回收。
+
+- [GitHub 仓库](https://github.com/lehuaner/swiper-loop-carousel)
+- [NPM 包](https://www.npmjs.com/package/@lehuan/swiper-loop-carousel)
 
 ## 特性
 
@@ -238,4 +250,4 @@ await preloader.waitFor(0);           // 等待加载完成
 
 ## License
 
-MIT
+MIT &copy; [lehuan](https://github.com/lehuaner). See [LICENSE](https://github.com/lehuaner/swiper-loop-carousel/blob/master/LICENSE) for details.
