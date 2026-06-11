@@ -1,6 +1,6 @@
 {
   "name": "@lehuan/swiper-loop-carousel",
-  "version": "1.3.3",
+  "version": "1.3.4",
   "description": "Swiper-based infinite loop carousel with thumbnail drag navigation, zoom, and multi-view modes",
   "type": "module",
   "sideEffects": [
