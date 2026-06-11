@@ -16,6 +16,15 @@ A Swiper-based infinite loop carousel component with thumbnail drag navigation, 
 - [NPM Package](https://www.npmjs.com/package/@lehuan/swiper-loop-carousel)
 - [中文文档](./README.md)
 
+## Screenshots
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/lehuaner/swiper-loop-carousel/master/assets/desktop.png" alt="Desktop screenshot" width="45%" />
+  <img src="https://raw.githubusercontent.com/lehuaner/swiper-loop-carousel/master/assets/mobile.png" alt="Mobile screenshot" width="30%" />
+  <br />
+  <em>Desktop (left) and Mobile (right) preview</em>
+</p>
+
 ## Features
 
 - **Infinite Loop** - Seamless head-to-tail transition via Swiper Loop

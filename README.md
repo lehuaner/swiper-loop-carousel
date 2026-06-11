@@ -18,6 +18,15 @@
 - [NPM 包](https://www.npmjs.com/package/@lehuan/swiper-loop-carousel)
 - [English Docs](./README.en.md)
 
+## 截图
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/lehuaner/swiper-loop-carousel/master/assets/desktop.png" alt="PC 端截图" width="45%" />
+  <img src="https://raw.githubusercontent.com/lehuaner/swiper-loop-carousel/master/assets/mobile.png" alt="手机端截图" width="30%" />
+  <br />
+  <em>PC 端（左）与手机端（右）展示效果</em>
+</p>
+
 ## 特性
 
 - **无限循环** - 基于 Swiper Loop，首尾无缝衔接

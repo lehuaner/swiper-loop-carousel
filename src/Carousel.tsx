@@ -1315,7 +1315,7 @@ function SwiperLoopCarousel({
 
   const swiperContainerStyle = {
     width: "90vw",
-    height: `calc(100dvh - ${BOTTOM_RESERVED}px - 32px)`,
+    height: `calc(100dvh - ${BOTTOM_RESERVED}px - 40px)`,
   } as CSSProperties;
 
   // 稳定化 Swiper props，避免每次渲染触发 Swiper 内部 updateSwiper
@@ -1625,7 +1625,7 @@ function SwiperLoopCarousel({
           role="dialog"
           aria-modal="true"
           aria-label={dialogLabel}
-          className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/90 sm:bg-black/85 sm:backdrop-blur-sm select-none pt-8 overflow-hidden"
+          className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/90 sm:bg-black/85 sm:backdrop-blur-sm select-none pt-10 overflow-hidden"
           style={{ overscrollBehavior: "none" }}
           onClick={() => {
             if (closeSuppressedRef.current) {
