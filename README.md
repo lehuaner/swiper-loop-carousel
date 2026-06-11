@@ -15,6 +15,7 @@
 
 - [GitHub 仓库](https://github.com/lehuaner/swiper-loop-carousel)
 - [NPM 包](https://www.npmjs.com/package/@lehuan/swiper-loop-carousel)
+- [English Docs](./README.en.md)
 
 ## 特性
 
