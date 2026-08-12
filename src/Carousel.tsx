@@ -134,7 +134,13 @@ const ThumbnailItem = React.memo(
 
     return (
       <motion.button
-        onClick={() => onThumbClick(idx)}
+        onClick={(e) => {
+          onThumbClick(idx);
+          // 点击缩略图是“跳转”语义，不应让该按钮保持键盘焦点，
+          // 否则后续用方向键切换中心图时，焦点仍停在此按钮上，
+          // 残留 focus-visible 白色 ring（白圈）。失焦后由 dialog 容器承接焦点。
+          e.currentTarget.blur();
+        }}
         animate={{
           scale: active ? activeScale : 1,
           opacity: active ? 1 : 0.6,
@@ -806,10 +812,10 @@ function SwiperLoopCarousel({
     const trigger = document.activeElement as HTMLElement | null;
     const overlay = overlayRef.current;
     if (overlay) {
-      const focusable =
-        overlay.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR);
-      // 使用 preventScroll 阻止 focus 导致的自动滚动，避免外部页面 scroll 回到顶部
-      focusable[0]?.focus({ preventScroll: true });
+      // 把焦点落到 dialog 容器本身，而非第一个可聚焦元素（第一张缩略图按钮），
+      // 否则该缩略图会一直持有 :focus-visible，残留白色 focus ring（白圈）。
+      // 使用 preventScroll 阻止 focus 导致的自动滚动，避免外部页面 scroll 回到顶部。
+      overlay.focus({ preventScroll: true });
     }
     const startKeyboardHold = (direction: "left" | "right") => {
       // 使用三级加速模拟按钮长按效果
@@ -1687,7 +1693,8 @@ function SwiperLoopCarousel({
           role="dialog"
           aria-modal="true"
           aria-label={dialogLabel}
-          className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/90 sm:bg-black/85 sm:backdrop-blur-sm select-none pt-10 overflow-hidden"
+          tabIndex={-1}
+          className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/90 sm:bg-black/85 sm:backdrop-blur-sm select-none pt-10 overflow-hidden outline-none"
           style={{ overscrollBehavior: "none" }}
           onClick={() => {
             if (closeSuppressedRef.current) {
