@@ -1728,6 +1728,7 @@ function SwiperLoopCarousel({
               onSwiper={handleSwiperInit}
               onSlideChange={handleSlideChange}
               className={`absolute inset-0 h-full w-full${isTransitioningViewMode ? " !overflow-visible" : ""}`}
+              wrapperClass="swiper-wrapper h-full min-h-0"
             >
               {slides}
             </MemoSwiper>

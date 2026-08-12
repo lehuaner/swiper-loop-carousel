@@ -310,7 +310,7 @@ export default function AnimatedSlideImg({
           opacity: imgLoaded ? 1 : 0,
           transition: "opacity 0.2s ease-in",
         }}
-        className="max-h-full max-w-full select-none object-contain cursor-grab active:cursor-grabbing"
+        className="h-full w-full select-none object-contain cursor-grab active:cursor-grabbing"
       />
     </motion.div>
   );
