@@ -1546,10 +1546,10 @@ function SwiperLoopCarousel({
     })();
     const isActive = activeIndices.has(index);
     return (
-      <SwiperSlide key={index} virtualIndex={index} className={`!flex items-center justify-center${viewMode === 1 && !isTransitioningViewMode ? " !overflow-hidden" : ""}`}>
+      <SwiperSlide key={index} virtualIndex={index} className={`!flex h-full min-h-0 items-center justify-center${viewMode === 1 && !isTransitioningViewMode ? " !overflow-hidden" : ""}`}>
         <div
           data-img-index={index}
-          className={`relative flex h-full w-full items-center justify-center ${isTransitioningViewMode ? "" : "overflow-hidden"}`}
+          className={`relative flex h-full min-h-0 w-full items-center justify-center ${isTransitioningViewMode ? "" : "overflow-hidden"}`}
           style={viewModeZIndex != null ? { position: "relative", zIndex: viewModeZIndex } : undefined}
         >
           <motion.div
@@ -1573,7 +1573,7 @@ function SwiperLoopCarousel({
               willChange: "transform",
               touchAction: "none",
             }}
-            className="flex h-full w-full items-center justify-center"
+            className="flex h-full min-h-0 w-full items-center justify-center"
           >
             <MemoAnimatedSlideImg
               src={img.src}
