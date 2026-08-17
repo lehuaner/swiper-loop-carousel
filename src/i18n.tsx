@@ -24,7 +24,12 @@ export type CarouselI18nKey =
   | "densityGroup"
   | "wheelGroup"
   | "wheelZoom"
-  | "wheelSwitch";
+  | "wheelSwitch"
+  | "deleteImage"
+  | "renameImage"
+  | "renamePlaceholder"
+  | "renameConfirm"
+  | "renameCancel";
 
 export type CarouselI18nStrings = Record<CarouselI18nKey, string>;
 
@@ -51,6 +56,11 @@ const defaultZh: CarouselI18nStrings = {
   wheelGroup: "滚轮功能",
   wheelZoom: "缩放",
   wheelSwitch: "切换",
+  deleteImage: "删除图片",
+  renameImage: "重命名",
+  renamePlaceholder: "输入新名称",
+  renameConfirm: "确定",
+  renameCancel: "取消",
 };
 
 const defaultEn: CarouselI18nStrings = {
@@ -74,6 +84,11 @@ const defaultEn: CarouselI18nStrings = {
   wheelGroup: "Wheel",
   wheelZoom: "Zoom",
   wheelSwitch: "Switch",
+  deleteImage: "Delete image",
+  renameImage: "Rename",
+  renamePlaceholder: "Enter new name",
+  renameConfirm: "OK",
+  renameCancel: "Cancel",
 };
 
 // ── Context ──

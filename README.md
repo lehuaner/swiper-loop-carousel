@@ -38,6 +38,8 @@
 - **国际化** - 内置中/英文，支持自定义覆盖
 - **受控/非受控** - 两种打开模式，灵活集成
 - **设置持久化** - 视图模式、缩略图密度、滚轮功能可选持久化到 localStorage
+- **缩略图条滚轮** - 鼠标悬停缩略图条时滚轮常驻切换图片（不受缩放/切换模式控制），逐帧合并、配合分页加载
+- **图片功能插槽** - 图片名称栏内置可自定义的动作栏（内置删除/重命名），支持自由调序、启停、换图标、注入真实业务逻辑
 
 ## 安装
 
@@ -194,6 +196,16 @@ import { CarouselI18nProvider } from "@lehuan/swiper-loop-carousel";
 | `extraOverlayContent` | `(props) => ReactNode` | - | 追加到覆盖层区域的额外内容 |
 | `onDownload` | `(index: number) => void` | - | 下载回调，传入后覆盖层显示下载按钮 |
 | `persistSettings` | `boolean \| string` | `undefined` | 是否持久化设置到 localStorage。`true` 使用默认存储键，`string` 使用自定义存储键，`undefined`/`false` 不持久化 |
+| `actions` | `CarouselAction[]` | 内置 `[rename, delete]` | 图片名称栏动作插槽。调用方完全控制顺序、启停、图标与函数；内置 `delete`/`rename` 的本地行为始终执行，`onSelect` 用于追加真实业务逻辑 |
+| `renameInputClassName` | `string` | - | 重命名输入框的自定义类名，附加于默认样式之后，用于覆盖字体/颜色/尺寸等 |
+| `enableConcurrent` | `boolean` | `true` | 并发分块下载总开关。为 `false` 时退化为原生整图预加载 |
+| `concurrency` | `number` | `6` | 分块段数。并发段数越多对单连接限速的突破越大，但连接数成本越高 |
+| `maxActiveImages` | `number` | `2` | 同时下载的图片张数。避免大量图片同时分块导致带宽碎片化 |
+| `preloadRange` | `number \| [number, number] \| []` | `[-1,1]` | 自动下载范围。数字 `N` 等价于 `[-N, N]`；`[a,b]` 表示 offset 从 `a` 到 `b`；`[]` 或 `0` 关闭自动预下载 |
+| `useCache` | `boolean` | `true` | URL 级结果缓存。同 URL 会话内只下载一次 |
+| `maxCache` | `number` | `80` | blob URL 缓存上限。超限撤销最旧的 blob URL（豁免当前显示中的图片） |
+| `loadDebounceMs` | `number` | `120` | 快速切换防抖毫秒数（默认 120）。连续切换期间不加载，用户停顿后才提交分块加载任务 |
+| `maxTasks` | `number` | `5` | 有界任务队列上限。新增任务时若已排满，直接停止末位（第 maxTasks 个）任务 |
 
 ### GalleryImage
 
@@ -210,6 +222,45 @@ interface GalleryImage {
   dimensions?: string;// 自定义尺寸文本，优先于 width×height
 }
 ```
+
+### 图片功能插槽（actions）
+
+动作栏渲染在图片名称栏的同一容器内。默认提供 `rename`（重命名）与 `delete`（删除）两个内置动作；不传 `actions` 时使用内置默认。传入后由调用方完全控制顺序、启停、图标与函数：
+
+```tsx
+import type { CarouselAction } from "@lehuan/swiper-loop-carousel";
+
+const actions: CarouselAction[] = [
+  { key: "rename", label: "重命名" },
+  {
+    key: "delete",
+    label: "删除",
+    // 内置 delete 的本地行为（飞出动画 + 本地卸载 + 更新顶部计数/底部缩略图）始终执行，
+    // onSelect 用于追加真实业务逻辑（如后端删除、持久化存储）。
+    onSelect: ({ image }) => {
+      // 在此接入真实删除逻辑（如调用删除接口）
+      void image;
+    },
+  },
+];
+
+<SwiperLoopCarousel images={images} actions={actions} renameInputClassName="custom-input-class" />
+```
+
+`CarouselAction` 字段：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `key` | `string` | 唯一标识。内置动作固定为 `"delete"`、`"rename"` |
+| `icon` | `ReactNode` | 图标节点（内置动作未传时使用默认 SVG 图标） |
+| `label` | `string` | 悬停提示 / 无障碍标签（新增动作建议提供） |
+| `enabled` | `boolean` | 是否启用。`false` 时灰显不可点击（默认 `true`） |
+| `onSelect` | `(ctx) => void` | 点击回调。内置 `delete`/`rename` 的本地行为始终执行，此回调用于追加调用方逻辑；非内置动作仅执行此回调 |
+
+行为说明：
+
+- **删除**：点击后播放「飞出」消失动画，随后在预览内本地卸载该图片 —— 顶部序号/总数、名称栏、底部缩略图即时更新。**组件不会真正删除资源**，真实删除由调用方在 `onSelect` 中设计；关闭并重新打开后已删除图片会恢复，除非调用方同步从 `images` 源数据中移除。
+- **重命名**：点击后唤起重命名输入框（默认样式，可通过 `renameInputClassName` 覆盖），输入过程实时刷新名称栏；`Enter` 提交、`Esc` 取消。重命名为本地即时生效（动态可变），持久化由调用方自行处理。
 
 ### Hooks
 
@@ -229,18 +280,52 @@ const { images, loadMore, hasMore, total, loaded } = usePaginatedImages(allImage
 | `total` | `number` | 全量图片总数 |
 | `loaded` | `number` | 已加载数量 |
 
-#### `useImagePreloader(images)`
+#### `useImagePreloader(images, options?)`
 
-图片预加载，获取原始尺寸。
+图片并发预加载。默认基于「并发分块下载 + 优先级队列 + 可配置下载范围」，零配置可用；服务端不支持时自动降级，绝不报错。
 
 ```ts
-const preloader = useImagePreloader(images);
-preloader.preload([0, 1, 2]);        // 预加载指定索引
-preloader.preloadAround(5);           // 预加载中心 ±3
-preloader.isLoaded(0);                // 是否已加载
-preloader.getDims(0);                 // 获取 { w, h }
-await preloader.waitFor(0);           // 等待加载完成
+const preloader = useImagePreloader(images, { preloadRange: [-2, 2] });
+preloader.preload([0, 1, 2]);              // 手动预加载指定索引
+preloader.preloadAround(5);                 // 以 5 为中心、按 preloadRange 立即提交任务
+preloader.requestLoad(5);                   // 防抖请求加载：连续切换时重置，停留 loadDebounceMs 后才提交
+preloader.clearPendingLoad();               // 清除待执行的防抖加载（关闭时调用）
+preloader.isLoaded(0);                      // 是否已加载
+preloader.hasError(0);                      // 是否加载失败
+preloader.getDims(0);                       // 获取 { w, h }
+preloader.getReadySrc(0);                   // 就绪后的最终 src（blob: 或原始 URL），未就绪返回 undefined
+preloader.markRendered(0);                  // 标记正在渲染，缓存淘汰时豁免其 blob URL
+preloader.inRange(0);                       // 是否在自动下载范围内
+preloader.getQueue();                       // 当前队列与状态（pending/downloading/done/error）
+await preloader.waitFor(0);                 // 等待加载完成
+preloader.setPriority(3, 0);                // 动态提权到最高（快速切换时置顶）
+preloader.pause(); preloader.resume();      // 暂停 / 恢复
+preloader.cancel("https://.../img.jpg");    // 取消某 URL
 ```
+
+所有参数都有默认值，可直接 `useImagePreloader(images)`。
+
+### 并发分块预加载
+
+为了突破国内运营商对部分 CDN（如 Cloudflare 泛播 IP）的单连接 QoS 限速，组件默认用 `fetch` + `Range` 头把单张原图拆成 `concurrency`（默认 6）段并行拉取，合并为 `Blob` 后以 `blob:` URL 作为最终渲染源，实测单连接约 150KB/s、6~8 线程可提升至 600KB/s 以上。
+
+**并发分块的前提条件**（不满足则自动降级为整块下载，仍不满足则回退原生加载，功能不受影响）：
+
+- 服务端支持 `Range`（响应带 `Content-Length` 与 `Accept-Ranges: bytes`）；
+- 存储域已配置 **CORS**，允许跨域 `fetch` 并暴露 `Content-Length` / `Accept-Ranges` / `Content-Type` 等响应头；
+- 文件足够大（默认 `< 256KB` 直接整块下载，分块不划算）；
+- 浏览器支持 `fetch` + `Blob` + `URL.createObjectURL`（现代浏览器均支持）。
+
+**行为说明**：
+
+- **优先级队列**：按与当前中心图距离排序，距离 0（当前图）最高；范围内「先右后左」，范围外不入队。
+- **快速切换**：连续切换（键盘/按钮连点）时，切换不触发任何下载；用户停顿 `loadDebounceMs`（默认 120ms）后才提交分块加载任务，避免频繁切换时不必要的带宽竞争。在途下载不中止，旧任务继续完成后自动移除。
+- **有界任务队列**：`maxTasks`（默认 5）限制任务队列上限。新增任务时若已排满，直接停止末位任务（中止其下载并移除），确保新任务优先。停止后若在完成期间又有新的停止操作触发分块，此前未完成的任务放置队尾，按序等待。
+- **并发张数**：`maxActiveImages`（默认 2）限制同时下载的图片张数，避免大量图片同时分块导致带宽碎片化。
+- **URL 级缓存**：同 URL 会话内只下载一次；`maxCache`（默认 80）超限撤销最旧的 blob URL，且豁免当前显示中的图片，防止白屏。
+- **CSP 注意**：若页面配置了严格 CSP 且 `connect-src` 不含图床域名，`fetch` 会被拦截，组件会自动回退到原生 `<img>` 加载，图片仍能显示，只是无提速。
+
+> 若要完全禁用该能力，传 `enableConcurrent={false}` 即退化为原生整图预加载；关闭自动预下载传 `preloadRange={0}` 或 `preloadRange={[]}`。
 
 #### `useWindowWidth()`
 

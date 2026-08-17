@@ -3,9 +3,15 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, type MutableRefObject } from "react";
 import { motion, useMotionValue, animate } from "motion/react";
 
+// 进度环：viewBox 48，圆半径 20 → 周长 2π·20 ≈ 125.66
+const CIRCUMFERENCE = 2 * Math.PI * 20;
+const clampPct = (v: number) => Math.max(0, Math.min(100, v));
+
 interface AnimatedSlideImgProps {
   src: string;
   alt: string;
+  /** 底层兜底图（缩略图）。原图就绪前常驻显示，避免 src 切换时的黑屏闪烁 */
+  underlaySrc?: string;
   isActive: boolean;
   wasActive?: boolean;
   loading: "eager" | "lazy";
@@ -17,6 +23,13 @@ interface AnimatedSlideImgProps {
   slideDirectionRef?: MutableRefObject<1 | -1>;
   isExitingOnViewModeChange?: boolean;
   onExitComplete?: () => void;
+  /** 显式指定是否显示加载转圈。传入时优先于内部的 imgLoaded 判定；
+   * 由 Carousel 驱动"当前目标图原图是否就绪"，避免缓存/下载时机导致的转圈时有时无 */
+  showSpinner?: boolean;
+  /** 当前原图下载进度百分比 0-100；progressKnown 为 true 时显示为圆环进度条而非转圈 */
+  downloadProgress?: number;
+  /** 是否已知道文件总大小（能计算真实百分比）。未知时进度环回退为旋转转圈 */
+  progressKnown?: boolean;
 }
 
 // Swiper 内单张图：
@@ -27,6 +40,7 @@ interface AnimatedSlideImgProps {
 export default function AnimatedSlideImg({
   src,
   alt,
+  underlaySrc,
   isActive,
   wasActive: wasActiveProp,
   loading,
@@ -38,6 +52,9 @@ export default function AnimatedSlideImg({
   slideDirectionRef,
   isExitingOnViewModeChange = false,
   onExitComplete,
+  showSpinner,
+  downloadProgress = 0,
+  progressKnown = false,
 }: AnimatedSlideImgProps) {
   const entryScale = useMotionValue(1);
   const entryOpacity = useMotionValue(1);
@@ -71,6 +88,25 @@ export default function AnimatedSlideImg({
       setImgLoaded(true);
     }
   }, []);
+
+  // src 变化（如缩略图 → 分块完成的 blob URL）时重置加载态，避免旧图残留闪烁
+  const prevSrcRef = useRef(src);
+  useEffect(() => {
+    if (prevSrcRef.current !== src) {
+      prevSrcRef.current = src;
+      imgLoadedRef.current = false;
+      setImgLoaded(false);
+      // src 换成已在缓存中的原图（关闭分块时是原生 URL、开启时是 blob）时，
+      // load 事件可能在 React 重新绑定 onLoad 前就已同步触发而丢失，
+      // 导致 imgLoaded 永远为 false、原图停在 opacity:0，视觉上“被缩略图盖住”。
+      // 此处用 complete/naturalWidth 立即补偿判定缓存命中。
+      const img = imgRef.current;
+      if (img && img.complete && img.naturalWidth > 0) {
+        imgLoadedRef.current = true;
+        setImgLoaded(true);
+      }
+    }
+  }, [src]);
 
   const handleImgLoad = useCallback(() => {
     if (!imgLoadedRef.current) {
@@ -280,6 +316,10 @@ export default function AnimatedSlideImg({
     }
   }, [isActive, viewModeOffsetX, entryXOffset, slideDirectionRef, entryScale, entryOpacity, entryX, cleanupAllAnims]);
 
+  // 当前 src 是否为"原图"（与底层缩略图不同）。是则等原图加载完成后再淡出缩略图，
+  // 切换期间缩略图常驻底层，彻底消除黑屏闪烁。
+  const isOriginal = Boolean(underlaySrc) && src !== underlaySrc;
+  const spinnerVisible = showSpinner ?? (isOriginal && !imgLoaded);
   return (
     <motion.div
       style={{
@@ -289,12 +329,45 @@ export default function AnimatedSlideImg({
       }}
       className="relative flex h-full w-full items-center justify-center"
     >
-      {!imgLoaded && (
-        <div className="absolute inset-0 flex items-center justify-center">
-          <svg className="h-8 w-8 animate-spin text-white/40" viewBox="0 0 24 24" fill="none">
-            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
-            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-          </svg>
+      {/* 底层缩略图：始终可见，作为原图加载期间的兜底，避免黑屏 */}
+      {isOriginal && (
+        <img
+          src={underlaySrc}
+          alt=""
+          draggable={false}
+          decoding="async"
+          onClick={(e) => e.stopPropagation()}
+          className="absolute inset-0 h-full w-full select-none object-contain"
+        />
+      )}
+      {/* 原图加载中：在缩略图上叠加统一的圆环加载指示。
+          知道总大小(progressKnown)时按真实百分比填充；未知时同款圆环做旋转(indeterminate)。
+          两种状态同一视觉，避免突兀切换 */}
+      {spinnerVisible && (
+        <div
+          className="absolute inset-0 z-10 flex items-center justify-center"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="relative h-16 w-16">
+            <svg
+              className={progressKnown ? "h-full w-full -rotate-90 drop-shadow" : "h-full w-full animate-spin drop-shadow"}
+              viewBox="0 0 48 48"
+              fill="none"
+            >
+              <circle className="text-white/20" cx="24" cy="24" r="20" stroke="currentColor" strokeWidth="4" />
+              <circle
+                className="text-white"
+                cx="24"
+                cy="24"
+                r="20"
+                stroke="currentColor"
+                strokeWidth="4"
+                strokeLinecap="round"
+                strokeDasharray={progressKnown ? CIRCUMFERENCE : CIRCUMFERENCE * 0.28}
+                strokeDashoffset={progressKnown ? CIRCUMFERENCE * (1 - clampPct(downloadProgress) / 100) : 0}
+              />
+            </svg>
+          </div>
         </div>
       )}
       <img
@@ -307,10 +380,10 @@ export default function AnimatedSlideImg({
         onLoad={handleImgLoad}
         onClick={(e) => e.stopPropagation()}
         style={{
-          opacity: imgLoaded ? 1 : 0,
+          opacity: !isOriginal || imgLoaded ? 1 : 0,
           transition: "opacity 0.2s ease-in",
         }}
-        className="h-full w-full select-none object-contain cursor-grab active:cursor-grabbing"
+        className="relative z-[5] h-full w-full select-none object-contain cursor-grab active:cursor-grabbing"
       />
     </motion.div>
   );

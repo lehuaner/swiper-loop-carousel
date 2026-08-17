@@ -36,6 +36,8 @@ A Swiper-based infinite loop carousel component with thumbnail drag navigation, 
 - **Internationalization** - Built-in Chinese/English, supports custom overrides
 - **Controlled/Uncontrolled** - Both open modes for flexible integration
 - **Settings Persistence** - View mode, thumbnail density, and wheel action can optionally persist to localStorage
+- **Thumbnail Strip Wheel** - Hovering the thumbnail strip switches images with the wheel (always on, independent of zoom/switch mode), frame-batched and pagination-aware
+- **Image Action Slots** - A customizable action bar inside the image name bar (built-in delete/rename), supporting free reordering, enable/disable, custom icons, and custom business logic
 
 ## Installation
 
@@ -192,6 +194,16 @@ When enabled, view mode, thumbnail density, and wheel action are saved to browse
 | `extraOverlayContent` | `(props) => ReactNode` | - | Extra content appended to the overlay area |
 | `onDownload` | `(index: number) => void` | - | Download callback; shows download button when provided |
 | `persistSettings` | `boolean \| string` | `undefined` | Persist settings to localStorage. `true` uses default key, `string` uses custom key, `undefined`/`false` disables |
+| `actions` | `CarouselAction[]` | built-in `[rename, delete]` | Image name bar action slots. Caller fully controls order, enable/disable, icon and function; built-in `delete`/`rename` always run their local behavior, `onSelect` appends real business logic |
+| `renameInputClassName` | `string` | - | Custom class name appended to the rename input default styles, to override font/color/size |
+| `enableConcurrent` | `boolean` | `true` | Concurrent chunked download master switch. `false` falls back to native full-image preload |
+| `concurrency` | `number` | `6` | Number of chunk segments. More segments better break single-connection throttling, at higher connection cost |
+| `maxActiveImages` | `number` | `2` | Concurrently downloaded image count. Avoids bandwidth fragmentation |
+| `preloadRange` | `number \| [number, number] \| []` | `[-1,1]` | Auto-download range. `N` equals `[-N, N]`; `[a,b]` offsets from `a` to `b`; `[]`/`0` disables auto preload |
+| `useCache` | `boolean` | `true` | URL-level result cache. Each URL downloads once per session |
+| `maxCache` | `number` | `80` | Blob URL cache limit. Evicts oldest blob URLs beyond limit (exempts currently displayed image) |
+| `loadDebounceMs` | `number` | `120` | Rapid-switch debounce ms. During consecutive switching no download happens; commit after user pauses |
+| `maxTasks` | `number` | `5` | Bounded task queue limit. When full, the tail (maxTasks-th) task is dropped to free room for new ones |
 
 ### GalleryImage
 
@@ -208,6 +220,45 @@ interface GalleryImage {
   dimensions?: string;// Custom dimension text, takes priority over width×height
 }
 ```
+
+### Image Action Slots (`actions`)
+
+The action bar renders inside the same container as the image name bar. Two built-in actions are provided by default: `rename` and `delete`. When `actions` is omitted, the built-in defaults apply; when provided, the caller fully controls order, enable/disable, icon and function:
+
+```tsx
+import type { CarouselAction } from "@lehuan/swiper-loop-carousel";
+
+const actions: CarouselAction[] = [
+  { key: "rename", label: "Rename" },
+  {
+    key: "delete",
+    label: "Delete",
+    // Built-in delete always runs its local behavior (fly-out animation + local
+    // unload + updates top counter / thumbnail strip). onSelect appends real logic.
+    onSelect: ({ image }) => {
+      // Hook your real deletion here (e.g. call a delete API)
+      void image;
+    },
+  },
+];
+
+<SwiperLoopCarousel images={images} actions={actions} renameInputClassName="custom-input-class" />
+```
+
+`CarouselAction` fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `key` | `string` | Unique id. Built-in actions use `"delete"` and `"rename"` |
+| `icon` | `ReactNode` | Icon node (built-in actions use default SVG icons when omitted) |
+| `label` | `string` | Tooltip / accessible label (recommended for custom actions) |
+| `enabled` | `boolean` | Whether enabled. `false` grays out and disables (default `true`) |
+| `onSelect` | `(ctx) => void` | Click callback. Built-in `delete`/`rename` always run their local behavior; this appends caller logic. Non-built-in actions only invoke this callback |
+
+Behavior notes:
+
+- **Delete**: plays a "fly-out" vanish animation on click, then locally unloads the image within the preview — top counter, name bar, and thumbnail strip update immediately. **The component does not delete the resource**; the caller designs real deletion in `onSelect`. The image returns after closing/reopening unless the caller also removes it from the `images` source.
+- **Rename**: invokes a rename input (default style, overridable via `renameInputClassName`), refreshing the name bar live while typing; `Enter` commits, `Esc` cancels. Renaming is local and dynamic; persistence is the caller's responsibility.
 
 ### Hooks
 
@@ -234,7 +285,9 @@ Preload images and obtain their original dimensions.
 ```ts
 const preloader = useImagePreloader(images);
 preloader.preload([0, 1, 2]);        // Preload specific indices
-preloader.preloadAround(5);           // Preload center ±3
+preloader.preloadAround(5);           // Immediately commit tasks centered at index 5
+preloader.requestLoad(5);             // Debounced load: resets on consecutive switches, commits after loadDebounceMs
+preloader.clearPendingLoad();         // Clear pending debounced load (call on close)
 preloader.isLoaded(0);                // Check if loaded
 preloader.getDims(0);                 // Get { w, h }
 await preloader.waitFor(0);           // Wait for load to complete

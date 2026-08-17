@@ -104,7 +104,7 @@ export default function HintBar({ isOpen, hintLabel, hintZoomDesktop, hintZoomMo
   return (
     <div
       ref={hintContainerRef}
-      className="pointer-events-auto relative w-max max-w-[73vw] cursor-grab overflow-hidden rounded-full bg-black/60 px-3 py-1 leading-none text-xs font-medium text-white active:cursor-grabbing sm:backdrop-blur-sm"
+      className="pointer-events-auto relative w-max max-w-[73vw] cursor-grab overflow-hidden rounded-full car__ctrl px-3 py-1 leading-none text-xs font-medium active:cursor-grabbing sm:backdrop-blur-sm"
       style={{ touchAction: "none" }}
       role="status"
       aria-live="polite"
