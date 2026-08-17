@@ -245,6 +245,16 @@ const MemoAnimatedSlideImg = React.memo(
 
 // 缩略图条单项：忽略 onThumbClick（稳定引用 + 内部仅触发一次），仅当 active 等视觉状态变化时重渲染
 // loaded 状态由组件内部管理，避免父组件 stripLoadVersion 变化导致所有缩略图重算
+interface ThumbnailItemProps {
+  img: GalleryImage;
+  idx: number;
+  active: boolean;
+  activeScale: number;
+  onThumbClick: (idx: number) => void;
+  stripHeight: number;
+  /** 相对于 strip 容器左边缘的 X 偏移（px），由父组件根据 startIdx 偏移计算 */
+  offsetX: number;
+}
 const ThumbnailItem = React.memo(
   function ThumbnailItem({
     img,
@@ -254,32 +264,12 @@ const ThumbnailItem = React.memo(
     onThumbClick,
     stripHeight,
     offsetX,
-  }: {
-    img: GalleryImage;
-    idx: number;
-    active: boolean;
-    activeScale: number;
-    onThumbClick: (idx: number) => void;
-    stripHeight: number;
-    /** 相对于 strip 容器左边缘的 X 偏移（px），由父组件根据 startIdx 偏移计算 */
-    offsetX: number;
-  }) {
+  }: ThumbnailItemProps) {
     // 局部可见性检测：进出视口只更新本缩略图组件，不触发 Carousel / 缩略图条整体重渲染
     const [inView, setRef] = useInView<HTMLButtonElement>("50px");
     const [loaded, setLoaded] = useState(false);
     const loadedRef = useRef(false);
     const imgElRef = useRef<HTMLImageElement>(null);
-
-    // 稳定化 animate/transition 引用：重渲染时若 active/activeScale 未变，
-    // motion 复用同一对象，避免 41 个缩略图在拖拽/导航时每次都重新设置 spring 动画。
-    const thumbAnimate = useMemo(
-      () => ({ scale: active ? activeScale : 1, opacity: active ? 1 : 0.6 }),
-      [active, activeScale]
-    );
-    const thumbTransition = useMemo(
-      () => ({ type: "spring" as const, stiffness: 320, damping: 24, mass: 0.7 }),
-      []
-    );
 
     // 检测图片是否已缓存（进入可见区域时 remount <img>，避免缓存命中时仍闪烁 skeleton）
     useLayoutEffect(() => {
@@ -291,7 +281,7 @@ const ThumbnailItem = React.memo(
     }, [inView]);
 
     return (
-      <motion.button
+      <button
         ref={setRef}
         onClick={(e) => {
           onThumbClick(idx);
@@ -300,10 +290,17 @@ const ThumbnailItem = React.memo(
           // 残留 focus-visible 白色 ring（白圈）。失焦后由 dialog 容器承接焦点。
           e.currentTarget.blur();
         }}
-        animate={thumbAnimate}
-        transition={thumbTransition}
         className={`flex-shrink-0 overflow-hidden rounded-md focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--car-ring)] ${active ? "relative z-10" : ""}`}
-        style={{ position: "absolute", left: offsetX, top: (stripHeight - THUMB_SIZE) / 2, width: THUMB_SIZE, height: THUMB_SIZE }}
+        style={{
+          position: "absolute",
+          left: offsetX,
+          top: (stripHeight - THUMB_SIZE) / 2,
+          width: THUMB_SIZE,
+          height: THUMB_SIZE,
+          transform: active ? `scale(${activeScale})` : "scale(1)",
+          opacity: active ? 1 : 0.6,
+          transition: "transform 0.22s cubic-bezier(0.34, 1.2, 0.64, 1), opacity 0.22s ease",
+        }}
         aria-label={`Go to ${img.alt}`}
         aria-current={active ? "true" : undefined}
       >
@@ -339,7 +336,7 @@ const ThumbnailItem = React.memo(
             <div className="absolute inset-0 car__strip" />
           )}
         </div>
-      </motion.button>
+      </button>
     );
   },
   (prev, next) =>
@@ -552,6 +549,9 @@ function SwiperLoopCarousel({
   const stripDragIdxRafRef = useRef<number | null>(null);
   // 已预加载的缩略图 URL 集合：避免同一 URL 重复 new Image() 预加载
   const thumbPreloadCacheRef = useRef<Set<string>>(new Set());
+  // 缩略图 JSX 缓存：offsetX 改为绝对索引定位后，切图时仅重建 active 变化的项，
+  // 其余项复用缓存元素，避免每次点击重建 41 个 ThumbnailItem（实测 ~25ms/点击）
+  const stripItemCacheRef = useRef<Map<number, React.ReactElement<ThumbnailItemProps>>>(new Map());
   const keyboardHoldTimerRef = useRef<number | null>(null);
   const keyboardHoldStartRef = useRef(0);
   const closeSuppressedRef = useRef(false);
@@ -2399,16 +2399,18 @@ function SwiperLoopCarousel({
   // 活跃 slide：统一使用浅拷贝占位 + 只替换 nearActiveSet 中的项
   // 避免 images.map() 全量创建 React Element（1000+ 张时每次切图都要重建）
   // 延迟到 overlay 打开时计算，退出动画期间保留缓存
+  // 虚拟模式(大 n)下 Swiper 只接收稳定的 placeholderSlides，slides 从不被使用，
+  // 若仍计算会在每次切图时无谓重建 nearActiveSet 的完整 JSX（实测 ~29ms/点击）
   const slidesCacheRef = useRef<React.ReactElement[]>([]);
   const slides = useMemo(() => {
-    if (!isOpen) return slidesCacheRef.current;
+    if (!isOpen || useVirtual) return slidesCacheRef.current;
     const result = placeholderSlides.slice();
     for (const index of nearActiveSet) {
       result[index] = renderSlideContent(index);
     }
     slidesCacheRef.current = result;
     return result;
-  }, [isOpen, placeholderSlides, nearActiveSet, renderSlideContent, preloader.progressVersion]);
+  }, [isOpen, useVirtual, placeholderSlides, nearActiveSet, renderSlideContent, preloader.progressVersion]);
 
   // 缩略图预加载：窗口移位前提前缓存渲染窗口外的缩略图。
   // 窗口移位时新缩略图 <img> 重挂载，若未缓存会触发网络请求+JPEG 解码造成卡顿（实测可达 1s）；
@@ -2431,7 +2433,8 @@ function SwiperLoopCarousel({
   }, [isOpen, realIndex, pendingRealIndex, isKeyboardActive, isStripDragging, stripDragVisibleIdx, n, images]);
 
   // 缩略图条虚拟化列表：仅当 realIndex/active/loaded 变化时重算
-  // 使用相对偏移定位（offsetX = 相对 startIdx 的像素偏移），避免大 idx 时 left 值过大
+  // 使用绝对索引定位（offsetX = i*pitch），配合 stripItemCacheRef 复用未变化的 JSX，
+  // 切图时仅重建 active 变化的项（~2-3 个），避免全量重建 41 个 ThumbnailItem
   const stripItems = useMemo(() => {
     // 拖拽时以拖拽可见中心为基准，键盘/按钮长按时以 pendingRealIndex 为基准，确保即将进入视口的缩略图已渲染
     const centerIdx = isStripDragging ? stripDragVisibleIdx : isKeyboardActive ? pendingRealIndex : realIndex;
@@ -2441,14 +2444,28 @@ function SwiperLoopCarousel({
     const thumbActiveTarget = isKeyboardActive ? pendingRealIndex : realIndex;
     const activeScale = isKeyboardActive ? 1 : (viewMode === 1 ? CENTER_SCALE : viewMode === 2 ? 1.15 : 1.1);
     const stripHeight = viewMode === 1 ? HIGHLIGHT_CENTER_WIDTH : CENTER_THUMB_SIZE;
+    const cache = stripItemCacheRef.current;
     const items = [];
     for (let i = startIdx; i <= endIdx; i++) {
       const img = images[i];
       const active = i >= thumbActiveTarget && i < thumbActiveTarget + viewMode;
-      // 相对偏移：idx 相对于 startIdx 的像素位置 + 双图模式额外间距
+      // 绝对索引偏移：i*pitch（与容器 stripX 变换配合，视觉位置不变）
+      // 双图模式额外间距
       const extraLeft = viewMode === 2 && active && i === thumbActiveTarget + 1 ? DUAL_HIGHLIGHT_EXTRA_GAP : 0;
-      const offsetX = (i - startIdx) * (THUMB_SIZE + THUMB_GAP) + extraLeft;
-      items.push(
+      const offsetX = i * (THUMB_SIZE + THUMB_GAP) + extraLeft;
+      const cached = cache.get(i);
+      if (
+        cached &&
+        cached.props.img === img &&
+        cached.props.active === active &&
+        cached.props.offsetX === offsetX &&
+        cached.props.activeScale === activeScale &&
+        cached.props.stripHeight === stripHeight
+      ) {
+        items.push(cached);
+        continue;
+      }
+      const el = (
         <ThumbnailItem
           key={i}
           img={img}
@@ -2460,8 +2477,14 @@ function SwiperLoopCarousel({
           offsetX={offsetX}
         />
       );
+      cache.set(i, el);
+      items.push(el);
     }
-    return { items, startIdx };
+    // 清理窗口外的缓存项，防止缓存无限增长
+    for (const key of Array.from(cache.keys())) {
+      if (key < startIdx - 2 || key > endIdx + 2) cache.delete(key);
+    }
+    return { items };
   }, [realIndex, isKeyboardActive, pendingRealIndex, viewMode, n, handleThumbClick, isStripDragging, stripDragVisibleIdx, images]);
 
   return (
@@ -2631,10 +2654,9 @@ function SwiperLoopCarousel({
                 className="absolute top-0 left-0"
                 style={{
                   // stripX 是基于全量宽度（n * 64px）的绝对偏移
-                  // marginLeft 补偿 startIdx 的偏移量，使容器只需覆盖可见缩略图范围
+                  // 缩略图项使用绝对索引定位（left = i*pitch），容器无需 marginLeft 补偿
                   // 容器宽度从 n*64px 降至 ~41*64px ≈ 2624px，大幅减少合成层面积
                   x: stripX,
-                  marginLeft: stripItems.startIdx * (THUMB_SIZE + THUMB_GAP),
                   width: (stripItems.items.length + 1) * (THUMB_SIZE + THUMB_GAP),
                   height: viewMode === 1 ? HIGHLIGHT_CENTER_WIDTH : CENTER_THUMB_SIZE,
                   touchAction: "pan-y",
@@ -2848,6 +2870,7 @@ function SwiperLoopCarousel({
                                 {isActive && (
                                   <motion.div
                                     layoutId="viewmode-active"
+                                    layoutDependency={"viewmode-active" as any}
                                     className="absolute inset-0 rounded-lg car__pill"
                                     transition={{ type: "spring", stiffness: 420, damping: 26, mass: 0.8 }}
                                   />
@@ -2904,6 +2927,7 @@ function SwiperLoopCarousel({
                                 {isActive && (
                                   <motion.div
                                     layoutId="density-active"
+                                    layoutDependency={"density-active" as any}
                                     className="absolute inset-0 rounded-lg car__pill"
                                     transition={{ type: "spring", stiffness: 420, damping: 26, mass: 0.8 }}
                                   />
@@ -2959,6 +2983,7 @@ function SwiperLoopCarousel({
                                 {isActive && (
                                   <motion.div
                                     layoutId="wheel-active"
+                                    layoutDependency={"wheel-active" as any}
                                     className="absolute inset-0 rounded-lg car__pill"
                                     transition={{ type: "spring", stiffness: 420, damping: 26, mass: 0.8 }}
                                   />
