@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, startTransition, Component, type CSSProperties, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { motion, AnimatePresence, useMotionValue, animate, MotionValue } from "motion/react";
 import { Swiper, SwiperSlide } from "swiper/react";
 import { Virtual } from "swiper/modules";
@@ -511,6 +512,12 @@ function SwiperLoopCarousel({
   });
   const [viewModeEpoch, setViewModeEpoch] = useState(0);
   const swiperRef = useRef<SwiperClass | null>(null);
+  // 虚拟模式分层定位：捕获 Swiper virtual slidesGrid（各 index 在 wrapper 内的真实 x 偏移）用于逐像素对齐
+  const virtualGridRef = useRef<number[] | null>(null);
+  // .swiper-wrapper 元素：虚拟模式图片分层经 createPortal 渲染到该节点内，继承 Swiper 的 transform
+  const wrapperElRef = useRef<HTMLElement | null>(null);
+  // Swiper 已挂载且有 wrapper 节点后置真，触发分层 portal 渲染
+  const [virtualReady, setVirtualReady] = useState(false);
   const initialLoadRef = useRef(false);
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const [isStripDragging, setIsStripDragging] = useState(false);
@@ -2015,6 +2022,10 @@ function SwiperLoopCarousel({
   const swiperVirtual = useMemo(() => useVirtual ? { addSlidesBefore: 5, addSlidesAfter: 5, cache: false } : undefined, [useVirtual]);
   const handleSwiperInit = useCallback((s: SwiperClass) => {
     swiperRef.current = s;
+    // 捕获虚拟网格与 wrapper，供分层对齐使用
+    if (s.virtual) virtualGridRef.current = (s.virtual as any).slidesGrid ?? null;
+    if (s.el) wrapperElRef.current = s.el.querySelector(".swiper-wrapper");
+    setVirtualReady(true);
     if (!initialLoadRef.current) {
       initialLoadRef.current = true;
     }
@@ -2130,7 +2141,7 @@ function SwiperLoopCarousel({
   }, [isOpen, images.length]);
 
   // 创建单个 slide 的内容（提取为函数，Virtual 和非 Virtual 模式共用）
-  const renderSlideContent = useCallback((index: number) => {
+  const renderSlideInner = useCallback((index: number) => {
     const img = images[index];
     // 并发预加载：范围内图片就绪前用缩略图兜底，分块完成后无缝替换为 blob URL；
     // 范围外图片保持原生 lazy 加载原始 src，避免与预加载产生双份下载。
@@ -2227,13 +2238,12 @@ function SwiperLoopCarousel({
       // 若不隐藏会从半透明"框架"区域直接看到左右两张邻图。
       ...(imgOverflowActive && !isActive ? { visibility: "hidden" } : {}),
     };
-    return (
-      <SwiperSlide
-        key={index}
-        virtualIndex={index}
-        onClick={(e) => e.stopPropagation()}
-        className={`!flex h-full min-h-0 items-center justify-center${viewMode === 1 && !isTransitioningViewMode && !imgOverflowing ? " !overflow-hidden" : ""}`}
-      >
+    // 该滑片内容（图片+motion）与滑片外壳(overflow 裁剪)拆分：
+    // - 非虚拟(小 n)：外壳 = SwiperSlide，内容放其内部
+    // - 虚拟(大 n)：内容放入独立分层(absolute)，盖在 Swiper 空占位滑片上，避免每次切图重渲染全量 children
+    const overflowClip = viewMode === 1 && !isTransitioningViewMode && !imgOverflowing;
+    const slideClassName = `!flex h-full min-h-0 items-center justify-center${overflowClip ? " !overflow-hidden" : ""}`;
+    const node: React.ReactElement = (
         <div
           data-img-index={index}
           className="relative flex h-full min-h-0 w-full items-center justify-center"
@@ -2349,9 +2359,38 @@ function SwiperLoopCarousel({
             </motion.div>
           )}
         </div>
+    );
+    return { node, slideClassName, overflowClip };
+  }, [images, realIndex, n, prevViewMode, viewMode, isTransitioningViewMode, containerWidth, containerHeight, preloader, preloader.version, isPinching, activeIndices, wasActiveMap, viewModeEpoch, slideDirectionRef, getOrCreateImageMotions, renderOverlay, onDownload, imgDraggingIdx, imgOverflowActive, actionsConfig, flyOutAndRemove, startRename, deletingId, renamedMapRef, renameSeq]);
+
+  // 非虚拟(<n)：内容包回 SwiperSlide，行为与原来完全一致
+  const renderSlideContent = useCallback((index: number) => {
+    const { node, slideClassName } = renderSlideInner(index);
+    return (
+      <SwiperSlide key={index} virtualIndex={index} onClick={(e) => e.stopPropagation()} className={slideClassName}>
+        {node}
       </SwiperSlide>
     );
-  }, [images, realIndex, n, prevViewMode, viewMode, isTransitioningViewMode, containerWidth, containerHeight, preloader, preloader.version, isPinching, activeIndices, wasActiveMap, viewModeEpoch, slideDirectionRef, getOrCreateImageMotions, renderOverlay, onDownload, imgDraggingIdx, imgOverflowActive, actionsConfig, flyOutAndRemove, startRename, deletingId, renamedMapRef, renameSeq]);
+  }, [renderSlideInner]);
+
+  // 虚拟(大 n)：内容包进绝对定位分层，盖在 Swiper 空占位滑片之上。
+  // 分层经 createPortal 放进 .swiper-wrapper，继承其 transform，切图时仅重渲染近活跃窗口。
+  // left 用 Swiper virtual slidesGrid 的真实偏移，保证与占位滑片逐像素对齐。
+  const virtualSpaceBetween = viewMode > 1 ? 8 : 2;
+  const virtualCellW = containerWidth > 0 ? (containerWidth - (viewMode - 1) * virtualSpaceBetween) / viewMode : 1;
+  const renderVirtualOverlaySlide = useCallback((index: number) => {
+    const { node, overflowClip } = renderSlideInner(index);
+    const g = virtualGridRef.current;
+    const left = g && index < g.length ? g[index] : index * (virtualCellW + virtualSpaceBetween);
+    return (
+      <div
+        key={index}
+        style={{ position: "absolute", top: 0, left, width: virtualCellW, height: "100%", overflow: overflowClip ? "hidden" : "visible" }}
+      >
+        {node}
+      </div>
+    );
+  }, [renderSlideInner, virtualCellW, virtualSpaceBetween]);
 
   // 活跃 slide：统一使用浅拷贝占位 + 只替换 nearActiveSet 中的项
   // 避免 images.map() 全量创建 React Element（1000+ 张时每次切图都要重建）
@@ -2471,8 +2510,18 @@ function SwiperLoopCarousel({
               wrapperClass="swiper-wrapper h-full min-h-0"
               style={imgOverflowActive ? { overflow: "visible" } : undefined}
             >
-              {slides}
+              {/* 虚拟(大 n)：Swiper 只拿"稳定的空占位 children"，切图不再触发其全量 getChildren/协调 */}
+              {useVirtual ? placeholderSlides : slides}
             </MemoSwiper>
+
+            {/* 虚拟(大 n)图片分层：内联渲染近活跃窗口的图片，放 .swiper-wrapper 内继承 Swiper transform。
+                因占位 children 引用稳定，切图时 MemoSwiper 直接 bail，仅重渲染此分层(O(近活跃集)) */}
+            {useVirtual && isOpen && wrapperElRef.current && virtualReady && createPortal(
+              <div className="absolute inset-0">
+                {Array.from(nearActiveSet).map((i) => renderVirtualOverlaySlide(i))}
+              </div>,
+              wrapperElRef.current
+            )}
 
             {/* 半透明"框架"边缘层：图片不做裁切，溢出部分被此半透明框覆盖而呈半透明，形成清晰边界。
               仅imgOverflowActive(单图模式拖拽/缩放溢出)时渲染；容器此时 overflow-visible 让框影透出。 */}
