@@ -188,6 +188,8 @@ const carThemeStyles = `
 const STRIP_VIRTUAL_RANGE = 20;
 /** 拖拽期间临时外扩的渲染半径（常驻 20，拖拽时每边多渲染 7，避免拖到边缘时一侧空白） */
 const STRIP_DRAG_VIRTUAL_RANGE = 27;
+/** 缩略图预加载前瞻：渲染窗口外每侧多预加载这么多张，窗口移位时新缩略图已缓存、无需网络加载+解码 */
+const THUMB_PRELOAD_LOOKAHEAD = 10;
 /** 分页加载预取余量：接近末尾（还剩这么多张）时提前 onNeedMore 续上下一页，
  *  避免长按/拖拽到第 100 张边界被卡住、还必须再按一次才能续上 */
 const PAGINATION_LOOKAHEAD = 20;
@@ -548,6 +550,8 @@ function SwiperLoopCarousel({
   const [stripDragVisibleIdx, setStripDragVisibleIdx] = useState(0);
   const stripDragVisibleIdxRef = useRef(0);
   const stripDragIdxRafRef = useRef<number | null>(null);
+  // 已预加载的缩略图 URL 集合：避免同一 URL 重复 new Image() 预加载
+  const thumbPreloadCacheRef = useRef<Set<string>>(new Set());
   const keyboardHoldTimerRef = useRef<number | null>(null);
   const keyboardHoldStartRef = useRef(0);
   const closeSuppressedRef = useRef(false);
@@ -2405,6 +2409,26 @@ function SwiperLoopCarousel({
     slidesCacheRef.current = result;
     return result;
   }, [isOpen, placeholderSlides, nearActiveSet, renderSlideContent, preloader.progressVersion]);
+
+  // 缩略图预加载：窗口移位前提前缓存渲染窗口外的缩略图。
+  // 窗口移位时新缩略图 <img> 重挂载，若未缓存会触发网络请求+JPEG 解码造成卡顿（实测可达 1s）；
+  // 预加载后移位瞬间从浏览器缓存即时显示，消除卡顿。
+  useEffect(() => {
+    if (!isOpen) return;
+    const centerIdx = isStripDragging ? stripDragVisibleIdx : isKeyboardActive ? pendingRealIndex : realIndex;
+    const range = (isStripDragging ? STRIP_DRAG_VIRTUAL_RANGE : STRIP_VIRTUAL_RANGE) + THUMB_PRELOAD_LOOKAHEAD;
+    const startIdx = Math.max(0, centerIdx - range);
+    const endIdx = Math.min(n - 1, centerIdx + range);
+    for (let i = startIdx; i <= endIdx; i++) {
+      const img = images[i];
+      if (!img || !img.thumbSrc || img.thumbSrc.startsWith("blob:")) continue;
+      if (thumbPreloadCacheRef.current.has(img.thumbSrc)) continue;
+      thumbPreloadCacheRef.current.add(img.thumbSrc);
+      const im = new Image();
+      im.decoding = "async";
+      im.src = img.thumbSrc;
+    }
+  }, [isOpen, realIndex, pendingRealIndex, isKeyboardActive, isStripDragging, stripDragVisibleIdx, n, images]);
 
   // 缩略图条虚拟化列表：仅当 realIndex/active/loaded 变化时重算
   // 使用相对偏移定位（offsetX = 相对 startIdx 的像素偏移），避免大 idx 时 left 值过大
