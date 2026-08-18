@@ -38,6 +38,9 @@ A Swiper-based infinite loop carousel component with thumbnail drag navigation, 
 - **Settings Persistence** - View mode, thumbnail density, and wheel action can optionally persist to localStorage
 - **Thumbnail Strip Wheel** - Hovering the thumbnail strip switches images with the wheel (always on, independent of zoom/switch mode), frame-batched and pagination-aware
 - **Image Action Slots** - A customizable action bar inside the image name bar (built-in delete/rename), supporting free reordering, enable/disable, custom icons, and custom business logic
+- **Concurrent Chunked Preloading** - Splits each full-size image into parallel segments via `fetch` + `Range` to break single-connection QoS throttling, with automatic degradation when unsupported
+- **TTFB Timeout Retry** - Automatically re-requests a chunk when the server response exceeds the threshold; a ring shows the real download percentage (same ring spins when total size is unknown)
+- **Theme Switching** - `dark` / `light` themes, one-click toggle for the whole palette
 
 ## Installation
 
@@ -175,6 +178,39 @@ When enabled, view mode, thumbnail density, and wheel action are saved to browse
 <SwiperLoopCarousel images={images} persistSettings="my-gallery-settings" />
 ```
 
+### Theme Switching
+
+Use the `theme` prop to toggle the whole palette with one switch (arrows, action menu, toolbar, thumbnail strip backgrounds/text colors change together; the overlay backdrop stays transparent and can be fine-tuned via CSS variables):
+
+```tsx
+// Light theme
+<SwiperLoopCarousel images={images} theme="light" />
+
+// Dark theme (default). Black controls are brightened by 10% over pure black for a softer silhouette
+<SwiperLoopCarousel images={images} theme="dark" />
+```
+
+### Concurrent Loading Configuration
+
+By default the component uses `fetch` + `Range` to split each full-size image into `concurrency` (default 6) parallel segments, merges them into a `Blob`, and uses the `blob:` URL as the final render source — breaking the single-connection QoS throttling seen on some CDNs (e.g. Cloudflare anycast IPs) in China. Real-world measurement: ~150KB/s on a single connection, up to 600KB/s+ with 6–8 concurrent segments. See the "Concurrent Chunked Preloading" section below for the mechanism and degradation rules.
+
+**Loading progress**: before the full-size image is ready, the thumbnail serves as a persistent underlay (no black-flash), with a unified ring on top — it fills to the real percentage when the total file size is known, and spins (same ring) when unknown; once ready, the thumbnail fades out and the `blob:` full image takes over.
+
+```tsx
+<SwiperLoopCarousel
+  images={images}
+  enableConcurrent          // enable chunked concurrency (default)
+  concurrency={8}           // 8 parallel segments per image
+  minChunkBytes={256 * 1024}
+  maxActiveImages={2}       // download at most 2 images concurrently
+  connectRetryMs={1200}     // re-request when TTFB exceeds this
+  enableConnectRetry        // enable timeout retry (default)
+  preloadRange={[-2, 2]}    // auto-preload ±2 images
+/>
+```
+
+> Each of `enableConcurrent`/`concurrency`/`minChunkBytes`/`maxActiveImages`/`connectRetryMs`/`preloadRange`/`useCache`/`maxCache`/`loadDebounceMs`/`maxTasks` can also be controlled individually — see the Props table below.
+
 ## API
 
 ### SwiperLoopCarousel Props
@@ -198,12 +234,16 @@ When enabled, view mode, thumbnail density, and wheel action are saved to browse
 | `renameInputClassName` | `string` | - | Custom class name appended to the rename input default styles, to override font/color/size |
 | `enableConcurrent` | `boolean` | `true` | Concurrent chunked download master switch. `false` falls back to native full-image preload |
 | `concurrency` | `number` | `6` | Number of chunk segments. More segments better break single-connection throttling, at higher connection cost |
+| `minChunkBytes` | `number` | `262144` | Chunk-size threshold (default 256KB). Files smaller than this are not chunked; the first request downloads the whole file |
 | `maxActiveImages` | `number` | `2` | Concurrently downloaded image count. Avoids bandwidth fragmentation |
 | `preloadRange` | `number \| [number, number] \| []` | `[-1,1]` | Auto-download range. `N` equals `[-N, N]`; `[a,b]` offsets from `a` to `b`; `[]`/`0` disables auto preload |
 | `useCache` | `boolean` | `true` | URL-level result cache. Each URL downloads once per session |
 | `maxCache` | `number` | `80` | Blob URL cache limit. Evicts oldest blob URLs beyond limit (exempts currently displayed image) |
 | `loadDebounceMs` | `number` | `120` | Rapid-switch debounce ms. During consecutive switching no download happens; commit after user pauses |
 | `maxTasks` | `number` | `5` | Bounded task queue limit. When full, the tail (maxTasks-th) task is dropped to free room for new ones |
+| `enableConnectRetry` | `boolean` | `true` | Master switch for TTFB timeout retry. `false` disables it |
+| `connectRetryMs` | `number` | `1000` | Re-request a chunk if the server response (TTFB) exceeds this many ms; only when `enableConnectRetry` is `true` |
+| `theme` | `"dark" \| "light"` | `"dark"` | Overall color theme. `"dark"` brightens black controls by 10% over pure black; `"light"` is a light theme |
 
 ### GalleryImage
 
@@ -278,20 +318,58 @@ const { images, loadMore, hasMore, total, loaded } = usePaginatedImages(allImage
 | `total` | `number` | Total number of all images |
 | `loaded` | `number` | Number of loaded images |
 
-#### `useImagePreloader(images)`
+#### `useImagePreloader(images, options?)`
 
-Preload images and obtain their original dimensions.
+Concurrent image preloading. Defaults to "concurrent chunked download + priority queue + configurable download range"; works with zero config and degrades gracefully (never errors) when the server is unsupported.
 
 ```ts
-const preloader = useImagePreloader(images);
-preloader.preload([0, 1, 2]);        // Preload specific indices
-preloader.preloadAround(5);           // Immediately commit tasks centered at index 5
-preloader.requestLoad(5);             // Debounced load: resets on consecutive switches, commits after loadDebounceMs
-preloader.clearPendingLoad();         // Clear pending debounced load (call on close)
-preloader.isLoaded(0);                // Check if loaded
-preloader.getDims(0);                 // Get { w, h }
-await preloader.waitFor(0);           // Wait for load to complete
+const preloader = useImagePreloader(images, { preloadRange: [-2, 2] });
+preloader.preload([0, 1, 2]);              // Preload specific indices
+preloader.preloadAround(5);                 // Immediately commit centered tasks by preloadRange
+preloader.requestLoad(5);                   // Debounced load: resets on consecutive switches, commits after loadDebounceMs
+preloader.requestActive(5, [4, 5, 6]);      // Immediately commit auto-range tasks for "center + visible set"
+preloader.clearPendingLoad();               // Clear the pending debounced load (call on close)
+preloader.isLoaded(0);                      // Check if loaded
+preloader.getProgress("https://.../img.jpg"); // { loaded, total } bytes downloaded for a URL, for progress UI
+preloader.hasError(0);                      // Check if load failed
+preloader.getDims(0);                       // Get { w, h }
+preloader.getReadySrc(0);                   // Final src once ready (blob: or original URL); undefined if not ready
+preloader.markRendered(0);                  // Mark as currently rendered; exempts its blob URL from cache eviction
+preloader.inRange(0);                       // Whether it is within the auto-download range
+preloader.getQueue();                       // Current queue & states (pending/downloading/done/error)
+await preloader.waitFor(0);                 // Wait for load to complete
+preloader.setPriority(3, 0);                // Dynamically raise priority (pin on rapid switching)
+preloader.pause(); preloader.resume();      // Pause / resume
+preloader.cancel("https://.../img.jpg");    // Cancel a URL
+preloader.progressVersion;                  // Download-progress change counter; render beat for the progress ring
+preloader.version;                          // Queue-state change counter; drives the seamless thumbnail→blob swap
 ```
+
+All parameters have defaults, so `useImagePreloader(images)` works directly.
+
+### Concurrent Chunked Preloading
+
+To break the single-connection QoS throttling some CDNs (e.g. Cloudflare anycast IPs) impose on domestic networks, the component splits each full-size image into `concurrency` (default 6) parallel segments via `fetch` + `Range`, merges them into a `Blob`, and renders the `blob:` URL. Measured ~150KB/s on one connection, 600KB/s+ with 6–8 segments.
+
+**Preconditions for chunked concurrency** (otherwise it degrades to full-file download, then native loading — functionality is unaffected):
+
+- Server supports `Range` (returns `Content-Length` and `Accept-Ranges: bytes`);
+- The storage domain is **CORS**-configured, allowing cross-origin `fetch` and exposing `Content-Length` / `Accept-Ranges` / `Content-Type`;
+- The file is large enough (files `< 256KB` are downloaded whole by default — chunking is not worthwhile);
+- The browser supports `fetch` + `Blob` + `URL.createObjectURL` (all modern browsers).
+
+**Behavior notes**:
+
+- **Priority queue**: sorted by distance from the current center image, distance 0 (current) highest; within range "right before left", out-of-range never enqueued.
+- **Rapid switching**: consecutive switches (keyboard/button mashing) trigger no downloads; after the user pauses `loadDebounceMs` (default 120ms) the chunked load commits, avoiding bandwidth contention. In-flight downloads are never aborted; old tasks finish then are removed.
+- **Bounded task queue**: `maxTasks` (default 5) caps the queue. When full, the tail task is dropped (download aborted, item removed) so the new task wins.
+- **Concurrent images**: `maxActiveImages` (default 2) caps how many images download at once, avoiding bandwidth fragmentation.
+- **URL-level cache**: each URL downloads once per session; `maxCache` (default 80) revokes the oldest blob URLs, exempting the currently displayed image to avoid white screens.
+- **TTFB timeout retry**: `connectRetryMs` (default 1000ms) sets the server-response (TTFB) threshold. If a chunk's response exceeds it (throttled/congested), the chunk is cancelled and re-requested — up to 3 retries per chunk. Disable with `enableConnectRetry={false}`. Combined with the ring progress below, slow sources visibly get re-pulled.
+- **Loading progress indicator**: the thumbnail persists as the underlay (no black-flash); a unified ring sits on top — filled to the real `downloadProgress` percentage when the total size is known (`progressKnown`), spinning in the same style when unknown. Both share one visual to avoid abrupt switches.
+- **CSP note**: under a strict CSP without the image host in `connect-src`, `fetch` is blocked; the component automatically falls back to native `<img>` loading — images still show, just without the speedup.
+
+> To fully disable it, pass `enableConcurrent={false}` to fall back to native full-image preload; to disable auto-preload, pass `preloadRange={0}` or `preloadRange={[]}`.
 
 #### `useWindowWidth()`
 

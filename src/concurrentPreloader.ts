@@ -239,7 +239,6 @@ export class ConcurrentPreloader {
     for (const i of visible) {
       if (i >= 0 && i < this.urls.length) targets.add(i);
     }
-    console.log("[preloader] commitActive targets", JSON.stringify([...targets]), "queueBefore", this.queue.length, "paused", this.paused);
     // 保留仍在途的下载，复用其进度（切图只是降级，不杀任务）
     const rest = this.queue.filter((q) => q.state === "downloading");
     const front: QueueItem[] = [];

@@ -511,8 +511,6 @@ function SwiperLoopCarousel({
   });
   const [viewModeEpoch, setViewModeEpoch] = useState(0);
   const swiperRef = useRef<SwiperClass | null>(null);
-  // 虚拟模式分层定位：捕获 Swiper virtual slidesGrid（各 index 在 wrapper 内的真实 x 偏移）用于逐像素对齐
-  const virtualGridRef = useRef<number[] | null>(null);
   // .swiper-wrapper 元素：虚拟模式图片分层经 createPortal 渲染到该节点内，继承 Swiper 的 transform
   const wrapperElRef = useRef<HTMLElement | null>(null);
   // Swiper 已挂载且有 wrapper 节点后置真，触发分层 portal 渲染
@@ -1977,11 +1975,11 @@ function SwiperLoopCarousel({
 
   // ── 渲染 ──
 
-  // 当前展示图是否因缩放/位移而溢出画布视口：是则放开最外层容器裁剪，
-  // 让溢出边缘以半透明"框架"透到画布外的背景上（配合框架层 dim），而非被裁掉。
-  // 单图、多图模式均生效；各图片自身仍按格子裁剪（viewMode>1 时 inner div 保持
-  // overflow-hidden），保证多图之间彼此不重叠。
-  // 用 React state 而非渲染期读 motion 判定溢出：滚轮缩放/触屏双指只改 motion 值、
+  // 容器恒定放开裁剪（overflow 恒 visible、框架层恒渲染），因此图片放大/位移时永远从画布边缘"透图"
+  // 到半透明框架上，拖拽中与松手后一致，而非仅拖拽时透出。
+  // 下方的 imgOverflowActive 仅用于窄屏下隐藏非活跃相邻图（避免其从框架暗区漏出），
+  // 不再参与容器裁剪/框架层的开关。
+  // 用 React state 而非渲染期读 motion 判定是否漂移溢出：滚轮缩放/触屏双指只改 motion 值、
   // 不触发 React 重渲染，若渲染期读 motion 值 imgOverflowActive 会停留旧值，
   // 导致"仅缩放不透图、必须拖拽后才透图"（拖拽的 setImgDraggingIdx 恰好触发重渲染）。
   const [imgOverflowState, setImgOverflowState] = useState(false);
@@ -2016,8 +2014,9 @@ function SwiperLoopCarousel({
     width: `calc(100vw - ${CANVAS_EDGE_PX * 2}px)`,
     height: `calc(100dvh - ${BOTTOM_RESERVED}px - ${CANVAS_EDGE_PX}px + 3px)`,
     borderRadius: 14,
-    // style 覆盖 className 的 overflow-hidden：仅当溢出且放开裁剪时透出，否则保持裁剪
-    overflow: imgOverflowActive ? "visible" : "hidden",
+    // style 覆盖 className 的 overflow-hidden：恒定放开裁剪，图片放大/位移溢出时始终从画布边缘"透图"到
+    // 半透明框架层上（松手后不退回裁剪），形成一直可见的半透明边缘。
+    overflow: "visible",
   } as CSSProperties;
 
   // 稳定化 Swiper props，避免每次渲染触发 Swiper 内部 updateSwiper
@@ -2026,8 +2025,6 @@ function SwiperLoopCarousel({
   const swiperVirtual = useMemo(() => useVirtual ? { addSlidesBefore: 5, addSlidesAfter: 5, cache: false } : undefined, [useVirtual]);
   const handleSwiperInit = useCallback((s: SwiperClass) => {
     swiperRef.current = s;
-    // 捕获虚拟网格与 wrapper，供分层对齐使用
-    if (s.virtual) virtualGridRef.current = (s.virtual as any).slidesGrid ?? null;
     if (s.el) wrapperElRef.current = s.el.querySelector(".swiper-wrapper");
     setVirtualReady(true);
     if (!initialLoadRef.current) {
@@ -2379,13 +2376,14 @@ function SwiperLoopCarousel({
 
   // 虚拟(大 n)：内容包进绝对定位分层，盖在 Swiper 空占位滑片之上。
   // 分层经 createPortal 放进 .swiper-wrapper，继承其 transform，切图时仅重渲染近活跃窗口。
-  // left 用 Swiper virtual slidesGrid 的真实偏移，保证与占位滑片逐像素对齐。
+  // left 用 index*(virtualCellW+virtualSpaceBetween) 计算：占位滑片即按相同节距(pitch)流式排布，
+  // 相对 wrapper 原点逐像素对齐，且不依赖 Swiper 内部 slidesGrid（其每次 update 都重建为新数组，
+  // 曾因捕获旧引用导致切换双图/三图 viewMode 后仍按旧节距定位、图片被推出视口）。
   const virtualSpaceBetween = viewMode > 1 ? 8 : 2;
   const virtualCellW = containerWidth > 0 ? (containerWidth - (viewMode - 1) * virtualSpaceBetween) / viewMode : 1;
   const renderVirtualOverlaySlide = useCallback((index: number) => {
     const { node, overflowClip } = renderSlideInner(index);
-    const g = virtualGridRef.current;
-    const left = g && index < g.length ? g[index] : index * (virtualCellW + virtualSpaceBetween);
+    const left = index * (virtualCellW + virtualSpaceBetween);
     return (
       <div
         key={index}
@@ -2555,7 +2553,7 @@ function SwiperLoopCarousel({
               onSlideChange={handleSlideChange}
               className={`absolute inset-0 h-full w-full${isTransitioningViewMode ? " !overflow-visible" : ""}`}
               wrapperClass="swiper-wrapper h-full min-h-0"
-              style={imgOverflowActive ? { overflow: "visible" } : undefined}
+              style={{ overflow: "visible" }}
             >
               {/* 虚拟(大 n)：Swiper 只拿"稳定的空占位 children"，切图不再触发其全量 getChildren/协调 */}
               {useVirtual ? placeholderSlides : slides}
@@ -2564,20 +2562,20 @@ function SwiperLoopCarousel({
             {/* 虚拟(大 n)图片分层：内联渲染近活跃窗口的图片，放 .swiper-wrapper 内继承 Swiper transform。
                 因占位 children 引用稳定，切图时 MemoSwiper 直接 bail，仅重渲染此分层(O(近活跃集)) */}
             {useVirtual && isOpen && wrapperElRef.current && virtualReady && createPortal(
-              <div className="absolute inset-0">
+              /* Swiper 在连续切换时会重插占位滑片到 wrapper，可能把本分层挤到占位滑片之前，
+                 导致占位层盖住图片、主图不可点击/拖拽。显式 z-index 保证图片分层始终在占位滑片之上。 */
+              <div className="absolute inset-0" style={{ zIndex: 2 }}>
                 {Array.from(nearActiveSet).map((i) => renderVirtualOverlaySlide(i))}
               </div>,
               wrapperElRef.current
             )}
 
             {/* 半透明"框架"边缘层：图片不做裁切，溢出部分被此半透明框覆盖而呈半透明，形成清晰边界。
-              仅imgOverflowActive(单图模式拖拽/缩放溢出)时渲染；容器此时 overflow-visible 让框影透出。 */}
-            {imgOverflowActive && (
-              <div
-                className="pointer-events-none absolute inset-0 z-[5]"
-                style={{ borderRadius: 14, boxShadow: "0 0 0 9999px var(--car-frame)" }}
-              />
-            )}
+              恒定渲染（容器 overflow 恒 visible），使半透明边缘/透图一直可见而非仅在拖拽缩放时出现。 */}
+            <div
+              className="pointer-events-none absolute inset-0 z-[5]"
+              style={{ borderRadius: 14, boxShadow: "0 0 0 9999px var(--car-frame)" }}
+            />
           </div>
 
           {extraOverlayContent && isOpen && extraOverlayContent({ image: images[realIndex], index: realIndex, total: totalCount, isActive: true })}

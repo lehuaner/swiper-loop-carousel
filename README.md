@@ -40,6 +40,9 @@
 - **设置持久化** - 视图模式、缩略图密度、滚轮功能可选持久化到 localStorage
 - **缩略图条滚轮** - 鼠标悬停缩略图条时滚轮常驻切换图片（不受缩放/切换模式控制），逐帧合并、配合分页加载
 - **图片功能插槽** - 图片名称栏内置可自定义的动作栏（内置删除/重命名），支持自由调序、启停、换图标、注入真实业务逻辑
+- **并发分块预加载** - 基于 `fetch` + `Range` 将单张原图拆成多段并行下载，突破单连接 QoS 限速，服务端不满足时自动降级
+- **TTFB 超时重发** - 服务器响应超过阈值自动重发该块，下载过程以圆环显示真实百分比（未知大小时同款圆环旋转）
+- **主题切换** - `dark` / `light` 双主题，一键切换整体配色
 
 ## 安装
 
@@ -177,6 +180,39 @@ import { CarouselI18nProvider } from "@lehuan/swiper-loop-carousel";
 <SwiperLoopCarousel images={images} persistSettings="my-gallery-settings" />
 ```
 
+### 主题切换
+
+通过 `theme` prop 一键切换整体配色（箭头、切换菜单、工具栏、缩略图条等控件的底色/文字色随之变化，覆盖层背景透明可配合 CSS 变量微调）：
+
+```tsx
+// 亮色主题
+<SwiperLoopCarousel images={images} theme="light" />
+
+// 暗色主题（默认）。暗色下黑色控件亮度较纯黑提升 10%，轮廓更清晰
+<SwiperLoopCarousel images={images} theme="dark" />
+```
+
+### 并发加载配置示例
+
+组件默认用 `fetch` + `Range` 头把单张原图拆成 `concurrency`（默认 6）段并行拉取，合并为 `Blob` 后以 `blob:` URL 作为最终渲染源，突破国内运营商对部分 CDN 的单连接 QoS 限速，实测单连接约 150KB/s、6~8 线程可提升至 600KB/s 以上。详细原理与降级见下方「并发分块预加载」章节。
+
+**加载进度**：原图就绪前先以缩略图做底层兜底（避免黑屏闪烁），其上叠加统一的圆环加载指示——已知文件总大小时按真实百分比填充，未知大小时同款圆环旋转；加载完成后缩略图淡出、切换到 `blob:` 原图。
+
+```tsx
+<SwiperLoopCarousel
+  images={images}
+  enableConcurrent          // 开启并发分块（默认）
+  concurrency={8}           // 每张图 8 段并行
+  minChunkBytes={256 * 1024}
+  maxActiveImages={2}       // 同时下载最多 2 张图
+  connectRetryMs={1200}     // TTFB 超过则重发
+  enableConnectRetry        // 开启超时重发（默认）
+  preloadRange={[-2, 2]}    // 自动预下载 ±2 张
+/>
+```
+
+> 也可单独通过 advanced props（`enableConcurrent`/`concurrency`/`minChunkBytes`/`maxActiveImages`/`connectRetryMs`/`preloadRange`/`useCache`/`maxCache`/`loadDebounceMs`/`maxTasks`）逐项控制并发策略，详见下方 Props 表。
+
 ## API
 
 ### SwiperLoopCarousel Props
@@ -200,12 +236,16 @@ import { CarouselI18nProvider } from "@lehuan/swiper-loop-carousel";
 | `renameInputClassName` | `string` | - | 重命名输入框的自定义类名，附加于默认样式之后，用于覆盖字体/颜色/尺寸等 |
 | `enableConcurrent` | `boolean` | `true` | 并发分块下载总开关。为 `false` 时退化为原生整图预加载 |
 | `concurrency` | `number` | `6` | 分块段数。并发段数越多对单连接限速的突破越大，但连接数成本越高 |
+| `minChunkBytes` | `number` | `262144` | 分块大小阈值（默认 256KB）。小于该字节数的文件不分块，首块请求即下载完整 |
 | `maxActiveImages` | `number` | `2` | 同时下载的图片张数。避免大量图片同时分块导致带宽碎片化 |
 | `preloadRange` | `number \| [number, number] \| []` | `[-1,1]` | 自动下载范围。数字 `N` 等价于 `[-N, N]`；`[a,b]` 表示 offset 从 `a` 到 `b`；`[]` 或 `0` 关闭自动预下载 |
 | `useCache` | `boolean` | `true` | URL 级结果缓存。同 URL 会话内只下载一次 |
 | `maxCache` | `number` | `80` | blob URL 缓存上限。超限撤销最旧的 blob URL（豁免当前显示中的图片） |
 | `loadDebounceMs` | `number` | `120` | 快速切换防抖毫秒数（默认 120）。连续切换期间不加载，用户停顿后才提交分块加载任务 |
 | `maxTasks` | `number` | `5` | 有界任务队列上限。新增任务时若已排满，直接停止末位（第 maxTasks 个）任务 |
+| `enableConnectRetry` | `boolean` | `true` | 服务器响应（TTFB）超时重发机制开关。为 `false` 时关闭超时重发 |
+| `connectRetryMs` | `number` | `1000` | 等待服务器响应超过该毫秒即重发本块；`enableConnectRetry` 为 `true` 时生效 |
+| `theme` | `"dark" \| "light"` | `"dark"` | 整体配色主题。`"dark"` 黑色控件亮度较纯黑提升 10%；`"light"` 为亮色主题 |
 
 ### GalleryImage
 
@@ -289,8 +329,10 @@ const preloader = useImagePreloader(images, { preloadRange: [-2, 2] });
 preloader.preload([0, 1, 2]);              // 手动预加载指定索引
 preloader.preloadAround(5);                 // 以 5 为中心、按 preloadRange 立即提交任务
 preloader.requestLoad(5);                   // 防抖请求加载：连续切换时重置，停留 loadDebounceMs 后才提交
+preloader.requestActive(5, [4, 5, 6]);      // 立即提交"当前中心 + 可见集"范围内的自动下载任务
 preloader.clearPendingLoad();               // 清除待执行的防抖加载（关闭时调用）
 preloader.isLoaded(0);                      // 是否已加载
+preloader.getProgress("https://.../img.jpg"); // 某 URL 已下载 { loaded, total } 字节，供进度指示用
 preloader.hasError(0);                      // 是否加载失败
 preloader.getDims(0);                       // 获取 { w, h }
 preloader.getReadySrc(0);                   // 就绪后的最终 src（blob: 或原始 URL），未就绪返回 undefined
@@ -301,6 +343,8 @@ await preloader.waitFor(0);                 // 等待加载完成
 preloader.setPriority(3, 0);                // 动态提权到最高（快速切换时置顶）
 preloader.pause(); preloader.resume();      // 暂停 / 恢复
 preloader.cancel("https://.../img.jpg");    // 取消某 URL
+preloader.progressVersion;                    // 下载进度变化计数，作为渲染节拍驱动进度环重算
+preloader.version;                            // 队列状态变化计数，驱动"缩略图→blob"的无缝替换
 ```
 
 所有参数都有默认值，可直接 `useImagePreloader(images)`。
@@ -323,6 +367,8 @@ preloader.cancel("https://.../img.jpg");    // 取消某 URL
 - **有界任务队列**：`maxTasks`（默认 5）限制任务队列上限。新增任务时若已排满，直接停止末位任务（中止其下载并移除），确保新任务优先。停止后若在完成期间又有新的停止操作触发分块，此前未完成的任务放置队尾，按序等待。
 - **并发张数**：`maxActiveImages`（默认 2）限制同时下载的图片张数，避免大量图片同时分块导致带宽碎片化。
 - **URL 级缓存**：同 URL 会话内只下载一次；`maxCache`（默认 80）超限撤销最旧的 blob URL，且豁免当前显示中的图片，防止白屏。
+- **TTFB 超时重发**：`connectRetryMs`（默认 1000ms）定义服务器响应阈值。某块的响应头（TTFB）超过该值视为被限流/拥堵，自动取消并重发该块，同块最多重试 3 次；`enableConnectRetry={false}` 可关闭。结合下方圆环进度，能直观看到慢源图的分块补拉过程。
+- **加载进度指示**：原图就绪前以缩略图常驻底层兜底（消除黑屏闪烁），其上叠加统一的圆环——`progressKnown`（已知文件总大小）时按 `downloadProgress` 真实百分比填充，未知大小时同款圆环旋转；两者同一视觉，避免突兀切换。
 - **CSP 注意**：若页面配置了严格 CSP 且 `connect-src` 不含图床域名，`fetch` 会被拦截，组件会自动回退到原生 `<img>` 加载，图片仍能显示，只是无提速。
 
 > 若要完全禁用该能力，传 `enableConcurrent={false}` 即退化为原生整图预加载；关闭自动预下载传 `preloadRange={0}` 或 `preloadRange={[]}`。
