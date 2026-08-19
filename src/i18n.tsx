@@ -29,7 +29,8 @@ export type CarouselI18nKey =
   | "renameImage"
   | "renamePlaceholder"
   | "renameConfirm"
-  | "renameCancel";
+  | "renameCancel"
+  | "emptyGallery";
 
 export type CarouselI18nStrings = Record<CarouselI18nKey, string>;
 
@@ -61,6 +62,7 @@ const defaultZh: CarouselI18nStrings = {
   renamePlaceholder: "输入新名称",
   renameConfirm: "确定",
   renameCancel: "取消",
+  emptyGallery: "暂无图片",
 };
 
 const defaultEn: CarouselI18nStrings = {
@@ -89,6 +91,7 @@ const defaultEn: CarouselI18nStrings = {
   renamePlaceholder: "Enter new name",
   renameConfirm: "OK",
   renameCancel: "Cancel",
+  emptyGallery: "No images",
 };
 
 // ── Context ──

@@ -233,6 +233,12 @@ const MemoAnimatedSlideImg = React.memo(
     prev.wasActive === next.wasActive &&
     prev.loading === next.loading &&
     prev.viewModeEpoch === next.viewModeEpoch &&
+    prev.deleteEpoch === next.deleteEpoch &&
+    prev.deleteShiftActive === next.deleteShiftActive &&
+    prev.deleteFillTarget === next.deleteFillTarget &&
+    prev.deleteFillSettledAt === next.deleteFillSettledAt &&
+    prev.deleteEntryTarget === next.deleteEntryTarget &&
+    prev.deleteTranslateX === next.deleteTranslateX &&
     prev.viewModeOffsetX === next.viewModeOffsetX &&
     prev.entryXFrom === next.entryXFrom &&
     prev.entryScaleFrom === next.entryScaleFrom &&
@@ -240,11 +246,14 @@ const MemoAnimatedSlideImg = React.memo(
     prev.isExitingOnViewModeChange === next.isExitingOnViewModeChange &&
     prev.showSpinner === next.showSpinner &&
     prev.downloadProgress === next.downloadProgress &&
-    prev.progressKnown === next.progressKnown
+    prev.progressKnown === next.progressKnown &&
+    prev.onThumbLoaded === next.onThumbLoaded &&
+    prev.thumbKey === next.thumbKey
 );
 
 // 缩略图条单项：忽略 onThumbClick（稳定引用 + 内部仅触发一次），仅当 active 等视觉状态变化时重渲染
 // loaded 状态由组件内部管理，避免父组件 stripLoadVersion 变化导致所有缩略图重算
+// 删除动画：isDeleting 时"向上飞出"；animOffsetX != 0 时其余项从旧位置平滑"靠拢"到新位置（FLIP）
 interface ThumbnailItemProps {
   img: GalleryImage;
   idx: number;
@@ -252,9 +261,15 @@ interface ThumbnailItemProps {
   activeScale: number;
   onThumbClick: (idx: number) => void;
   stripHeight: number;
-  /** 相对于 strip 容器左边缘的 X 偏移（px），由父组件根据 startIdx 偏移计算 */
+  /** 相对于 strip 容器左边缘的 X 偏移（px），由父组件根据绝对索引计算 */
   offsetX: number;
+  /** 挂载时的相对 X 偏移（旧位置到新位置的差值），用于删除后靠拢动画；0 表示无位移动画 */
+  animOffsetX: number;
+  /** 该项是否正被删除：是则播放"向上飞出"动画 */
+  isDeleting: boolean;
 }
+/** 缩略图删除时向上飞出的高度 */
+const THUMB_FLY_UP = THUMB_SIZE + 16;
 const ThumbnailItem = React.memo(
   function ThumbnailItem({
     img,
@@ -264,6 +279,8 @@ const ThumbnailItem = React.memo(
     onThumbClick,
     stripHeight,
     offsetX,
+    animOffsetX,
+    isDeleting,
   }: ThumbnailItemProps) {
     // 局部可见性检测：进出视口只更新本缩略图组件，不触发 Carousel / 缩略图条整体重渲染
     const [inView, setRef] = useInView<HTMLButtonElement>("50px");
@@ -280,8 +297,11 @@ const ThumbnailItem = React.memo(
       }
     }, [inView]);
 
+    const targetScale = isDeleting ? 0.5 : active ? activeScale : 1;
+    const targetOpacity = isDeleting ? 0 : active ? 1 : 0.6;
+
     return (
-      <button
+      <motion.button
         ref={setRef}
         onClick={(e) => {
           onThumbClick(idx);
@@ -297,9 +317,23 @@ const ThumbnailItem = React.memo(
           top: (stripHeight - THUMB_SIZE) / 2,
           width: THUMB_SIZE,
           height: THUMB_SIZE,
-          transform: active ? `scale(${activeScale})` : "scale(1)",
-          opacity: active ? 1 : 0.6,
-          transition: "transform 0.22s cubic-bezier(0.34, 1.2, 0.64, 1), opacity 0.22s ease",
+        }}
+        initial={
+          animOffsetX === 0 && !isDeleting
+            ? false
+            : { x: animOffsetX, y: 0, scale: targetScale, opacity: targetOpacity }
+        }
+        animate={{
+          x: 0,
+          y: isDeleting ? -THUMB_FLY_UP : 0,
+          scale: targetScale,
+          opacity: targetOpacity,
+        }}
+        transition={{
+          x: { type: "tween", duration: 0.34, ease: [0.22, 1, 0.36, 1] },
+          y: isDeleting ? { type: "tween", duration: 0.3, ease: [0.42, 0, 1, 1] } : { type: "tween", duration: 0.2 },
+          scale: { type: "spring", stiffness: 420, damping: 30 },
+          opacity: { type: "tween", duration: isDeleting ? 0.25 : 0.2 },
         }}
         aria-label={`Go to ${img.alt}`}
         aria-current={active ? "true" : undefined}
@@ -336,7 +370,7 @@ const ThumbnailItem = React.memo(
             <div className="absolute inset-0 car__strip" />
           )}
         </div>
-      </button>
+      </motion.button>
     );
   },
   (prev, next) =>
@@ -345,7 +379,9 @@ const ThumbnailItem = React.memo(
     prev.active === next.active &&
     prev.activeScale === next.activeScale &&
     prev.stripHeight === next.stripHeight &&
-    prev.offsetX === next.offsetX
+    prev.offsetX === next.offsetX &&
+    prev.animOffsetX === next.animOffsetX &&
+    prev.isDeleting === next.isDeleting
 );
 
 // ── 图片功能插槽类型 ──
@@ -360,8 +396,8 @@ export interface CarouselActionCtx {
 export interface CarouselAction {
   /** 唯一标识。缺省内置动作为 "delete"、"rename" */
   key: string;
-  /** 图标（可自定义节点） */
-  icon: ReactNode;
+  /** 图标（可自定义节点）。缺省时对内置动作自动补全其默认图标（delete→垃圾桶、rename→铅笔） */
+  icon?: ReactNode;
   /** 悬停提示 / 无障碍标签 */
   label?: string;
   /** 是否启用（默认 true；false 灰显不可点击） */
@@ -373,6 +409,9 @@ export interface CarouselAction {
 }
 
 // 内置动作 SVG 图标（可被调用方以自定义 icon 覆盖）
+const DownloadIcon = (
+  <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>
+);
 const TrashIcon = (
   <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /><line x1="10" y1="11" x2="10" y2="17" /><line x1="14" y1="11" x2="14" y2="17" /></svg>
 );
@@ -488,6 +527,92 @@ function SwiperLoopCarousel({
   // 通过 liveImages 统一过滤，索引自动重排；真实删除由调用方在 action.onSelect 里完成。
   const removedIdsRef = useRef<Set<number>>(new Set());
   const [removeEpoch, setRemoveEpoch] = useState(0);
+  // 删除提交后递增：驱动活跃行"未被删除的幸存图"按切换动画重放入场
+  const [deleteEpoch, setDeleteEpoch] = useState(0);
+  // 最近一次删除的被删图下标（重排前的原始下标）。渲染时据此判断某图是否位于被删图右侧：
+  // 仅右侧幸存图(index >= 该值)重放"下一张"切换动画，左侧幸存图保持不动。
+  const lastDeletedIndexRef = useRef<number>(-1);
+  // 被删图右侧、仍活跃的幸存图的 img.id → 删除静置时刻（performance.now，ms）。
+  // 用时间戳 Map 而非 Set：删除重排/复位会让组件多次重挂载，时间戳跨重挂载稳定；
+  // 且"新鲜度"判定取代定时清空，避免快速连续删除时清空早于/晚于复位延迟事件，
+  // 导致已到位的幸存卡在 deleteFillTarget 失效后被重新判为新图而重放一次入场动画。
+  const relocateFillIdsRef = useRef<Map<number, number>>(new Map());
+  // 仅"右幸存图"（不含右侧新进入的 incoming）的 img.id → 静置时刻：重排后这些图已就地移动到位，
+  // 顶部名称/功能按钮栏重挂载时须跳过入场淡入，避免"平移到位了名称又加载一遍"。
+  const relocateSurvivorFillIdsRef = useRef<Map<number, number>>(new Map());
+  // 删除的重排(removeEpoch)是否已提交：提交后禁止再触发"左移补位"（重排前的窗口专属）。
+  // 提交后保持 true 直到下一次删除开始（flyOutAndRemove 置回 false），不再定时清空。
+  const deletingReshapedRef = useRef(false);
+  // ===== 源码级删除平移：共享 groupShiftX =====
+  // 删除活跃行（含行首）时，被删图右侧的"整段"图由**单个共享 motion 值** groupShiftX 一次性平滑
+  // 左移一格：算法层只维护这一次动画（同一动画源 → 多卡零失步，观感等同"下一张"wrapper 平移）；
+  // 被删图左侧的图不绑定该值 → 源码层面天然原地不动，无需逐卡补位，也无需反向补偿。
+  const groupShiftX = useMotionValue(0);
+  const groupShiftAnimRef = useRef<ReturnType<typeof animate> | null>(null);
+  // ===== 删除动画串行化 =====
+  // 连续删除时，若上一个删除仍处在其动画窗口内（重排/复位未完成），后到的删除若立即执行，会与
+  // 连续的共享 groupShiftX / lastDeletedIndexRef：第二个删除重启动共享平移时从"上一个
+  // 删除已冻结的中间位移"出发，且被删图右侧段成员随 lastDeleted 改写而变，导致"第二次删除右侧无
+  // 平移、"被删图回到原位再消失、最终跳着到位"的并发失真。因此用一把同步锁把删除动画严格串行：
+  // 一次只播放一个删除动画，后到的删除先入队，等当前删除重排提交、wrapper 复位稳定后再按 img.id
+  // 在最新数组中定位并依次应用。单张删除（最常见路径）不受影响，仍即时播放。
+  const serialDeleteLockRef = useRef(false);
+  const pendingDeleteQueueRef = useRef<GalleryImage[]>([]);
+  // 删除代际计数：每次删除开始递增，供"延迟复位（runReset 重试链）"做代际守卫。
+  // 上一轮删除的 runReset 若在主线程繁忙时拖延到下一轮删除动画期间才执行，
+  // 会用 groupShiftX.set(0)/slideToLoop 拨动正在播放的新删除动画（平移图回弹、
+  // 被删图动画被重置）。代际不一致即中止，复位职责移交新一轮删除自己。
+  const deleteGenRef = useRef(0);
+  // 触发后续删除的当前 flyOutAndRemove（ref 恒指向最新闭包，重排后仍能按最新 images 定位）
+  const flyOutAndRemoveRef = useRef<(index: number, img: GalleryImage) => void>(() => {});
+  // 当前删除重排提交后，等待 Swiper 复位稳定再应用队列内下一张删除的缓冲（ms）。
+  // 需覆盖 runReset(setTimeout 0) 及 loop 复位的 rAF 延迟，又远小于一次真实删除周期，体验近无感。
+  const DELETE_SERIAL_BUFFER_MS = 260;
+  // canSlide 删除的 Swiper 复位期间：抑制 handleSlideChange 对 realIndex 的同步。
+  // loop 模式 reset 会经过 slideToLoop 的中间循环位并触发 slideChange，把 realIndex 短暂拨到
+  // 别处——幸存的活跃卡随之 isActive 闪断、wasActiveRef 被重置为 false，复位完成后又恢复 active，
+  // 导致它被当作"新图"重放一次"缩放+淡入"二次入场。删除已把 realIndex 固定为 R，复位期间只需
+  // 维持该值，因此整体忽略复位期间的 slideChange。
+  const suppressRealIndexSyncRef = useRef(false);
+  // 复位后延迟 slideChange 的抑制截止时刻：slideToLoop 内部经 requestAnimationFrame 延迟执行
+  // slideTo、loopFix 也可能再同步/异步拨动一次，这些 slideChange 在同步块结束后才触发，
+  // 仅靠 suppressRealIndexSyncRef 会漏网。用时间戳把抑制窗口延伸到复位之后，覆盖全部延迟事件。
+  const resetSuppressUntilRef = useRef(0);
+  // 复位后延迟 slideChange 的抑制窗口（ms）：覆盖 slideToLoop 的 rAF 延迟 + loopFix 的连锁拨动。
+  // 快速连续删除时主线程繁忙，rAF 延迟的 slideTo 可能晚于 300ms 才触发 slideChange；
+  // 放宽到 500ms，确保复位产生的全部延迟事件都落在抑制窗口内。
+  const RESET_SUPPRESS_MS = 500;
+  // 删除静置标记（relocateFillIdsRef / relocateSurvivorFillIdsRef）的新鲜度窗口（ms）。
+  // 须覆盖"重排(460) + Swiper 复位(500) + 复位抑制(500) + rAF 连锁拨动余量"，
+  // 窗口内重挂载/抖动的幸存卡仍按"已静置"处理，不再重放入场动画；窗口外自然失效。
+  const DELETE_FILL_VALID_MS = 2000;
+  // 删除后的"Swiper 复位"定时器：连续删除时防抖，只保留"最近一次提交"之后的那一份。
+  // 若不合并，残留的多套 500ms 定时器会在最后一张图已静置稳定后异步晚触发——再次
+  // updateSlides/slideTo 拨动 Swiper 触发 slideChange，导致已到位的图被重新判为新图。
+  const settleResetTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (settleResetTimerRef.current != null) window.clearTimeout(settleResetTimerRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  // 惰性清理：删除开始时剔除已过期（超过 DELETE_FILL_VALID_MS）的静置标记；
+  // 全部过期后复位 lastDeletedIndexRef / deletingReshapedRef，让后续渲染恢复正常判定。
+  // 不再用定时器清空集合：快速连续删除时定时清空会与复位延迟事件竞争，导致已到位的图
+  // 在 deleteFillTarget 失效后被重新判为新图而重放一次入场动画（"到位后又闪一下入场"）。
+  const pruneDeleteFillState = useCallback(() => {
+    const now = performance.now();
+    for (const [id, ts] of relocateFillIdsRef.current) {
+      if (now - ts > DELETE_FILL_VALID_MS) relocateFillIdsRef.current.delete(id);
+    }
+    for (const [id, ts] of relocateSurvivorFillIdsRef.current) {
+      if (now - ts > DELETE_FILL_VALID_MS) relocateSurvivorFillIdsRef.current.delete(id);
+    }
+    if (relocateFillIdsRef.current.size === 0) {
+      lastDeletedIndexRef.current = -1;
+      deletingReshapedRef.current = false;
+    }
+  }, []);
   const liveImages = useMemo(() => {
     if (removedIdsRef.current.size === 0) return imagesRaw;
     return imagesRaw.filter((img) => !removedIdsRef.current.has(img.id));
@@ -500,6 +625,13 @@ function SwiperLoopCarousel({
   const [renameState, setRenameState] = useState<{ id: number; value: string } | null>(null);
   // 让下游全部基于有效列表工作（indexed by liveImages）
   const images = liveImages;
+  // 供串行化删除的队列接力读取"最新"数组（删除重排提交后闭包里的 images 已过期）
+  const imagesRef = useRef(images);
+  imagesRef.current = images;
+  // 原始数组的实时 ref：队列接力需在"渲染期 imagesRef 尚未更新"时也能拿到最新有效列表，
+  // 用"原始数组 + 已删除集合（ref，同步更新）"实时过滤，避免依赖渲染时机。
+  const imagesRawRef = useRef(imagesRaw);
+  imagesRawRef.current = imagesRaw;
   const [activeId, setActiveId] = useState<number | null>(null);
   const isControlled = isOpenProp !== undefined;
   const isOpen = isControlled ? isOpenProp : activeId !== null;
@@ -550,6 +682,9 @@ function SwiperLoopCarousel({
   // 缩略图 JSX 缓存：offsetX 改为绝对索引定位后，切图时仅重建 active 变化的项，
   // 其余项复用缓存元素，避免每次点击重建 41 个 ThumbnailItem（实测 ~25ms/点击）
   const stripItemCacheRef = useRef<Map<number, React.ReactElement<ThumbnailItemProps>>>(new Map());
+  // 缩略图当前绝对 X 位置（按 img.id）。删除后索引重排时，据此算出"旧→新位置"差值
+  // 作为 animOffsetX，驱动其余缩略图平滑靠拢（FLIP）。每次 stripItems 重算时重建。
+  const thumbPositionsRef = useRef<Map<number, number>>(new Map());
   const keyboardHoldTimerRef = useRef<number | null>(null);
   const keyboardHoldStartRef = useRef(0);
   const closeSuppressedRef = useRef(false);
@@ -622,6 +757,48 @@ function SwiperLoopCarousel({
   const isPinchingRef = useRef(false);
   useEffect(() => { isPinchingRef.current = isPinching; }, [isPinching]);
   const [isTransitioningViewMode, setIsTransitioningViewMode] = useState(false);
+  // 普通"上一张/下一张"滑动过渡的进行态（Swiper wrapper 平移，React 无对应状态）。
+  // 过渡期间非活跃邻图（正在退出的上一张/进入的下一张）必须在画布上可见，避免被
+  // 半透明框架的"空闲时隐藏邻图"逻辑（neighborHidden）在飞出一开始就隐藏——那会让
+  // 切换时看不到左边的图飞出。过渡结束（transitionEnd）后回到隐藏状态，防边缘泄漏不变。
+  const [isSwipeAnimating, setIsSwipeAnimating] = useState(false);
+
+  // 已实际加载完成的缩略图 src 集合（由 AnimatedSlideImg 在上报 onThumbLoaded 时写入）。
+  // 切换动画期间原图未就绪时：只有缩略图已就位才用缩略图兜底、不再叠加转圈；
+  // 缩略图都未就绪（连续快速点击导致）时才以转圈作占位。动画结束后恢复"原图未就绪即转圈"。
+  const thumbLoadedRef = useRef<Set<string>>(new Set());
+  const [, setThumbTick] = useState(0);
+  const onThumbLoaded = useCallback((thumbKey: string) => {
+    if (thumbKey && !thumbLoadedRef.current.has(thumbKey)) {
+      thumbLoadedRef.current.add(thumbKey);
+      setThumbTick((t) => t + 1);
+    }
+  }, []);
+
+  // 统一的视图模式切换入口：冻结 wrapper → 标记过渡 → 切换 viewMode。
+  // 手动切换（底部下拉、renderToolbar）与按图片数量自动收敛共用，保证自动切换与
+  // 手动切换走同一套"逐卡重排 + 平移/缩放"过渡动画（isTransitioningViewMode 驱动）。
+  const changeViewMode = useCallback(
+    (mode: 1 | 2 | 3) => {
+      if (mode === viewMode) return;
+      preViewModeIndexRef.current = realIndexRef.current;
+      prevViewModeRef.current = viewMode;
+      setPrevViewMode(viewMode);
+      const s = swiperRef.current;
+      if (s && !s.destroyed) {
+        const wrapper = s.wrapperEl as HTMLElement;
+        wrapper.style.transition = "none";
+        wrapper.style.transform = window.getComputedStyle(wrapper).transform;
+        s.params.speed = 0;
+      }
+      isViewModeChangingRef.current = true;
+      setIsTransitioningViewMode(true);
+      setViewMode(mode);
+      setViewModeEpoch((e) => e + 1);
+    },
+    [viewMode]
+  );
+
   const containerRef = useRef<HTMLDivElement>(null);
   const pinchStateRef = useRef<{
     initialDist: number;
@@ -635,7 +812,7 @@ function SwiperLoopCarousel({
   const getOrCreateImageMotions = useCallback((index: number): ImageMotions => {
     let m = imageMotionsMapRef.current.get(index);
     if (!m) {
-      m = { x: new MotionValue(0), y: new MotionValue(0), scale: new MotionValue(1) };
+      m = { x: new MotionValue(0), y: new MotionValue(0), scale: new MotionValue(1), entryX: new MotionValue(0) };
       imageMotionsMapRef.current.set(index, m);
     }
     return m;
@@ -684,23 +861,261 @@ function SwiperLoopCarousel({
   const flyOutAndRemove = useCallback(
     (index: number, img: GalleryImage) => {
       if (deletingId === img.id || removedIdsRef.current.has(img.id)) return;
+      // 串行化锁：当前已有删除动画在窗口内（含重排/复位阶段）时，本删除先入队，
+      // 待其完整结束后（见下方 setTimeout）按 img.id 在最新数组中定位再应用。避免并发共享
+      // groupShiftX/lastDeletedIndexRef 导致的"第二次删除右侧段无平移、被删图回弹、跳着到位"。
+      if (serialDeleteLockRef.current) {
+        pendingDeleteQueueRef.current.push(img);
+        return;
+      }
+      serialDeleteLockRef.current = true;
+      // 惰性清理上一轮已过期的静置标记（新鲜度窗口外自然失效，取代定时清空）
+      pruneDeleteFillState();
+      // ===== 新一轮删除：先清算上一轮的残留，保证动画从干净基线出发 =====
+      // 1) 递增删除代际：令任何仍在运行/待运行的旧复位（runReset 重试链）失效，避免其在本轮
+      //    动画期间执行 groupShiftX.set(0)/slideToLoop 拨动（症状：平移图"直接到位又弹回去"、
+      //    被删图动画被重置）。
+      deleteGenRef.current++;
+      // 2) 取消上一轮尚未执行的复位定时器（已开始运行的由代际守卫兜底）。
+      if (settleResetTimerRef.current != null) {
+        window.clearTimeout(settleResetTimerRef.current);
+        settleResetTimerRef.current = null;
+      }
+      // 3) 上一轮若复位被拖延，groupShiftX 可能仍冻结在 -一格：先归零到干净基线，
+      //    保证本轮 animate(groupShiftX, -shift) 从 0 出发（否则起点已到位 → 平移图无位移"无反应"）。
+      //    注意：这里不把 groupShiftAnimRef.current 置 null —— 本轮后续 groupShift 动画会重新赋值；
+      //    且避免 TS 在本函数体内把 current 收窄为 null 而破坏后续既有的 current?.stop()。
+      groupShiftX.set(0);
+      groupShiftAnimRef.current?.stop();
       setDeletingId(img.id);
+      // 上一删除可能仍在"重排已提交"抑制窗口内：新删除必须立即退出该窗口，
+      // 否则 deleteShiftActive/deleteEntryTarget 里的 !deletingReshapedRef 判定为假，
+      // 本次补位/入场动画整组失效（表现为"原地消失后从右侧飞入"的概率性跳变）。
+      deletingReshapedRef.current = false;
+      // 注意：不能在删除开始时清空 relocateFillIdsRef / relocateSurvivorFillIdsRef。
+      // 快速连续删除时，前一次删除的幸存图/incoming 图尚未重排重挂载，若在此清空，
+      // 它们重排到位后 deleteFillTarget 会判定为假 → 又走一次入场飞入（到位后再闪一下）。
+      // 集合应累积，时间戳在重排提交时统一刷新，交给新鲜度判定自然失效。
       const m = getOrCreateImageMotions(index);
-      // 飞出动画：向右下飞出并缩小，动画结束后再真正移除
-      animate(m.scale, 0.12, { duration: 0.3, ease: "backIn" });
-      animate(m.x, 64, { duration: 0.3, ease: "backIn" });
-      animate(m.y, 40, { duration: 0.3, ease: "backIn" });
+      const wasReal = realIndexRef.current;
+      // 记录被删图下标（重排前的原始下标）：右侧整段靠它判定是否共享平移
+      lastDeletedIndexRef.current = index;
+      // 删除动画：被删图在原地缩小（0.25），不再向上飞出，速度与切换动画(0.4s)一致
+      animate(m.scale, 0.25, { duration: 0.4, ease: "easeOut" });
+      animate(m.x, 0, { duration: 0.4, ease: "easeOut" });
+      animate(m.y, 0, { duration: 0.4, ease: "easeOut" });
+
+      // ===== 删除发生在活跃行内 → 驱动"右侧整段共享平移"（源码级改造） =====
+      // 不调用 swiper.slideToLoop 去"切到下一张"（那会带动整条 wrapper、连左侧卡一起移）。而是把
+      // "被删图右侧所有图左移一格"表达为**一个共享 motion 值** groupShiftX 从 0 → -一格槽距：
+      // 右侧每张卡在同一渲染里读取该值 → 视觉上即一次 wrapper 平移级别的平滑整段移动（同一动画源零失步）。
+      // 被删图左侧的卡不读取 → 原地不动。与切换同速（0.4s easeOut）、同位移（一整格槽距）。
+      if (index >= wasReal && index < wasReal + viewMode) {
+        const gGap = viewMode > 1 ? 8 : 0;
+        const gSlotW = containerWidth > 0 ? (containerWidth - (viewMode - 1) * gGap) / viewMode : containerWidth;
+        const gShift = containerWidth > 0 ? gSlotW + gGap : 0;
+        if (gShift > 0) {
+          groupShiftAnimRef.current?.stop();
+          groupShiftAnimRef.current = animate(groupShiftX, -gShift, { duration: 0.4, ease: "easeOut" });
+        }
+      }
+
+      // ===== 删除：目标 =====
+      // 被删图自身向上缩小飞出；其右侧整段图由共享 groupShiftX 一次性平滑左移一格（同上 0.4s 同步），
+      // 观感等同"下一张"切换的连续平移；重排(removeEpoch)延后到动画结束再提交，落位无感。
+      slideDirectionRef.current = index < wasReal || index >= n - 1 ? -1 : 1;
+      // 记录删除窗口内被"共享平移"移动过的图（按 img.id 记，跨重挂载稳定）：
+      // - 被删图右侧、仍活跃的幸存图：随共享值左移一格补位；
+      // - 从右侧进入新末位的下一张图（realIndex+viewMode）：同段左移入场。
+      // 两者重排后都须静置到位，不再二次动画。时间戳先占位，重排提交时统一刷新为静置时刻。
+      if (index >= wasReal && index < wasReal + viewMode) {
+        for (let k = index + 1; k < wasReal + viewMode && k < n; k++) {
+          const sib = images[k];
+          if (sib && !removedIdsRef.current.has(sib.id)) {
+            relocateFillIdsRef.current.set(sib.id, 0);
+            relocateSurvivorFillIdsRef.current.set(sib.id, 0);
+          }
+        }
+        const incoming = images[wasReal + viewMode];
+        if (incoming && !removedIdsRef.current.has(incoming.id)) {
+          relocateFillIdsRef.current.set(incoming.id, 0);
+        }
+      }
+      // 复用切换的图片加载管线：删除窗口内"从右侧进入的新图"（realIndex+viewMode）不在
+      // requestActive 的 visible 集内，需等重排后 realIndex 更新才被加载；这里立即 requestLoad，
+      // 让它像切换时进入的那张图一样在入场动画期间尽早就绪，避免"边动画边加载"造成的闪烁。
+      const enteringIdx = wasReal + viewMode;
+      const entering = images[enteringIdx];
+      if (entering && !removedIdsRef.current.has(entering.id)) {
+        preloader.requestLoad(enteringIdx);
+      }
+      // 立即递增 deleteEpoch：左移补位与飞出同一时刻启动（旧链路在 460ms 重排后才启动，导致两者串行）
+      setDeleteEpoch((e) => e + 1);
+
       window.setTimeout(() => {
         removedIdsRef.current.add(img.id);
-        // 清除该下标的历史 motion 状态，避免重排后隔壁图片（占据该下标）继承飞到一半的动画
-        imageMotionsMapRef.current.delete(index);
-        dirtyMotionIndicesRef.current.delete(index);
+        // 重排后整列左移：被删图位置及其右侧的所有新占据者会整体左移一格，而外层缩放/拖拽的
+        // motion 是按 index 记录的，若不清理，补位图会错位继承"原位图残留的 scale/x/y"导致
+        // 显示异常。因此把这些新槽位（被删位置到结尾）全部重置为默认，保证到位后的图回到默认位置；
+        // 被删图左侧的图 index 不变，各自参数不受影响。
+        for (let k = index; k < n; k++) {
+          imageMotionsMapRef.current.delete(k);
+          dirtyMotionIndicesRef.current.delete(k);
+        }
         setDeletingId(null);
+        // 删除发生在活跃行之前 → realIndex 需前移一位，保持当前观看内容不变，
+        // 否则活跃行错位（且 loop 模式可能残留被删图的克隆）。
+        if (index < wasReal) {
+          const targetReal = Math.max(0, wasReal - 1);
+          realIndexRef.current = targetReal;
+          pendingRealIndexRef.current = targetReal;
+          setRealIndex(targetReal);
+          setPendingRealIndex(targetReal);
+        } else if (index === wasReal) {
+          // 删除活跃行首图（源码级共享平移路径，删除窗口内未走 goToIndex，realIndex 全程保持 wasReal）：
+          // 重排后数组缩一张，原 wasReal+1 → 新 wasReal，本应是目标中心。这里显式把它固定为 wasReal，
+          // 与该卡"整段左移一格补位"后的落位完全一致，绝不再出现"目标中心只停留一瞬再跳到第三张"。
+          realIndexRef.current = wasReal;
+          setRealIndex(wasReal);
+        }
+        // 重排已提交：此后不再触发"左移补位"（移动已在该窗口内完成）
+        deletingReshapedRef.current = true;
         setRemoveEpoch((e) => e + 1);
-      }, 320);
+        // ===== 从重排提交起开启 slideChange 抑制 =====
+        // 重排后 images 少一张，Swiper 收到新 children 会自动 updateSlides 并发一次 slideChange，
+        // 其 realIndex 是"删除点后物理位置 +1"（例如删除中心图 R → Swiper 实为 R+1）。
+        // 而我们期望的"目标中心"是重排后 realIndex 保持 R（显示原 R+1 那张）；若不加抑制，
+        // 这次未受控的 slideChange 会用 setRealIndex(R+1) 覆盖，导致目标中心只停留一瞬后
+        // 跳到第三张（原 R+2）。故从重排提交这一刻就开启抑制窗口，覆盖
+        // "children 数量变化 → 复位(500ms 后) → 复位后 rAF 异步" 全程，保证 realIndex 稳定。
+        // 后续复位定时器还会再延长时间戳，最终窗口覆盖到复位彻底完成。
+        resetSuppressUntilRef.current = performance.now() + 500 + RESET_SUPPRESS_MS;
+        // ===== 静置时刻刷新 =====
+        // 重排提交即"静置归位"：把全部删除静置标记刷新为当前时刻（跨重挂载稳定，
+        // 供 AnimatedSlideImg 抑制复位产生的异步 isActive 抖动导致的二次入场）。
+        // 不再定时清空集合：由新鲜度判定 + 惰性清理（pruneDeleteFillState）自然失效，
+        // 避免快速连续删除时清空与复位延迟事件竞争，导致已到位的图重放一次入场动画。
+        const settleNow = performance.now();
+        for (const id of relocateFillIdsRef.current.keys()) {
+          relocateFillIdsRef.current.set(id, settleNow);
+        }
+        for (const id of relocateSurvivorFillIdsRef.current.keys()) {
+          relocateSurvivorFillIdsRef.current.set(id, settleNow);
+        }
+        // ===== 共享平移：结束动画，但【不立即归零】 =====
+        // 右侧整段 groupShiftX 使它们比原始槽位左移一格。此刻若立即 set(0)，会在"被删图移除
+        // 尚未落地渲染"的那一帧让右侧卡先弹回原位、被删图仍显示——即"零点几秒回弹闪烁"。
+        // 因此只停掉动画(冻结在 -shift 端点)，真正的归零推迟到 runReset：等 removal 渲染提交、与
+        // wrapper 复位(归位到 wasReal)同一帧发生，净位移不变，右侧卡不闪现、左侧卡则始终没动过。
+        groupShiftAnimRef.current?.stop();
+        groupShiftAnimRef.current = null;
+        // ===== Swiper 复位：防抖合并到"最近一次删除提交"之后再执行 =====
+        // 快速连续删除会各自排一套定时器，停止后残留的多套定时器会在最后一张图已静置
+        // 稳定后异步晚触发——再次 updateSlides/slideTo 拨动 Swiper 触发 slideChange，
+        // 导致已到位的图被重新判为"新图"再放一次入场动画。这里用单一防抖槽位：每次提交只
+        // 覆盖上一份待执行的复位，停止后仅保留最后一份。
+        if (settleResetTimerRef.current != null) window.clearTimeout(settleResetTimerRef.current);
+        // 复位必须紧随重排：重排后 arrays 缩一张，被删图右侧图整体 index -1（图2：旧1→新0），
+        // 而删除动画驱动的 wrapper 仍停在旧 index（如中心图删除后 goToIndex(1) 让 wrapper 停 1）。
+        // 若复位拖延，wrapper 停在的旧 index 在重排后恰好映射到"再后一张"（1→图3），
+        // 会先显示错位的"图3 一瞬"，再被复位拨回目标（图2）——即"目标中心后闪过另一张再回来"。
+        // 因此复位等到 Swiper 把 children 更新到 newN 后就立即把 wrapper 归位到 target，
+        // 将错位窗口压缩到"Swiper 更新→复位"之间的一帧左右，视觉上无感。
+        // 复位本身沿用 loopDestroy/loopCreate + slideToLoop，仍是 Swiper 自身的归位机制，
+        // 不改变删除动画（被删图自定义缩小 + 右侧图复用下一张切换平移）。
+        const newN = Math.max(0, n - 1);
+        let resetAttempt = 0;
+        // 记录本次删除的代际：runReset 可能在主线程繁忙时拖延到下一轮删除开始后才真正执行，
+        // 此时必须中止，把复位职责让给新一轮删除（否则会拨动其正在播放的动画）。
+        const resetGen = deleteGenRef.current;
+        const runReset = () => {
+          if (deleteGenRef.current !== resetGen) return; // 已被后续删除取代，中止
+          const s = swiperRef.current;
+          if (!s || s.destroyed) return;
+          // Swiper children 尚未更新到 newN 时下一帧重试（最多 ~240ms），保证复位作用在新数组上。
+          if (s.slides.length !== newN && resetAttempt < 16) {
+            resetAttempt++;
+            window.setTimeout(runReset, 16);
+            return;
+          }
+          settleResetTimerRef.current = null;
+          const target = realIndexRef.current;
+          // 归零时机与复位同帧：此刻被删图已移除落地渲染(removal 已提交)、wrapper 即将复位到 target。
+          // 先令右侧整段共享平移归零，再随复位(归位到 wasReal)一并生效 → 净位移不变、绝无回弹闪烁。
+          groupShiftX.set(0);
+          groupShiftAnimRef.current?.stop();
+          groupShiftAnimRef.current = null;
+          if (typeof window !== "undefined") {
+            console.log("[RST]", { target, slidesLen: s.slides.length, newN, attempt: resetAttempt, now: performance.now().toFixed(0) });
+          }
+          // 复位期间抑制 handleSlideChange（loop 复位的 slideToLoop 会暂时拨动 realIndex，
+          // 导致已补位并稳定下来的幸存卡被误判"新图"而重放一次入场动画）。
+          suppressRealIndexSyncRef.current = true;
+          // 同步块只覆盖 loopFix 的同步 slideTo；slideToLoop 内部经 rAF 延迟执行的 slideTo
+          // 及其连锁拨动在 finally 之后才触发 slideChange，须用时间戳把抑制窗口延伸到复位之后。
+          resetSuppressUntilRef.current = performance.now() + RESET_SUPPRESS_MS;
+          try {
+            const isLoop = !useVirtual && !hasMore && newN > viewMode;
+            if (isLoop) {
+              s.loopDestroy();
+              s.updateSlides();
+              s.loopCreate();
+              s.slideToLoop(target, 0);
+            } else {
+              s.updateSlides();
+              s.slideTo(target, 0);
+            }
+          } finally {
+            suppressRealIndexSyncRef.current = false;
+            /* 忽略：非虚拟/极窄场景下 updateSlides 可能抛错 */
+          }
+          // 抑制窗口内若用户导航，其 slideChange 会被忽略、jumpTargetRef 无法被正常清除；
+          // 窗口结束后统一清掉，避免残留目标让后续滑动/导航的 slideChange 被误判为"中间索引"而忽略。
+          window.setTimeout(() => {
+            jumpTargetRef.current = null;
+          }, RESET_SUPPRESS_MS);
+        };
+        settleResetTimerRef.current = window.setTimeout(runReset, 0);
+        // ===== 串行化释放 / 队列接力 =====
+        // 当前删除重排已提交、复位已调度。等待复位稳定（DELETE_SERIAL_BUFFER_MS）后：
+        // - 队列非空 → 按 img.id 在"最新 images"中定位下一张待删图并立即应用（链条式接力）；
+        // - 队列为空 → 释放串行锁，允许新的删除即时开始。
+        // 用 ref 回读最新数组/回调，避免闭包里的旧 images / 旧 flyOutAndRemove。
+        window.setTimeout(() => {
+          const q = pendingDeleteQueueRef.current;
+          if (q.length === 0) {
+            serialDeleteLockRef.current = false;
+            return;
+          }
+          let processed = false;
+          let guard = 0;
+          while (q.length > 0 && guard++ < 3) {
+            const next = q[0];
+            q.shift();
+            if (!next || removedIdsRef.current.has(next.id)) continue; // 已被移除则跳过
+            // 用"原始数组 + 已删除集合（ref，同步更新）"实时计算最新有效列表，
+            // 避免依赖渲染期才更新的 imagesRef：快速连删/重载时 React 渲染可能延迟，
+            // 读到旧数组会导致 findIndex 索引错位 → 删除动画打到错误的卡片上（被删图"直接消失"）。
+            const latest = imagesRawRef.current.filter((im) => !removedIdsRef.current.has(im.id));
+            const ni = latest.findIndex((im) => im.id === next.id);
+            if (ni < 0) continue; // 数组里已不存在，跳过继续下一个
+            // 关键：先释放锁，再交付。此处仍处于"上一删除调度本定时器"的锁内（serialDeleteLockRef=true），
+            // 若直接调 flyOutAndRemoveRef，其入口的 `if (serialDeleteLockRef.current)` 会把它再次塞回队列，
+            // 导致下一张永远不被真正删除、锁也永远不被释放（第二次删除完全无动画、图卡死不动）。
+            // 先置 false 让被交付的删除以"新删除"身份正常获取锁、并调度它自己的释放定时器（链条式接力）。
+            serialDeleteLockRef.current = false;
+            flyOutAndRemoveRef.current(ni, latest[ni]);
+            processed = true;
+            break;
+          }
+          if (!processed) serialDeleteLockRef.current = false; // 队列里没有可删项时才兜底释放
+        }, DELETE_SERIAL_BUFFER_MS);
+      }, 460);
     },
-    [deletingId, getOrCreateImageMotions]
+    [deletingId, getOrCreateImageMotions, images, n, viewMode, hasMore, preloader, pruneDeleteFillState, containerWidth]
   );
+  // 队列接力触发的后续删除必须命中"最新"的实现（重排后 images/deletingId 均更新）
+  flyOutAndRemoveRef.current = flyOutAndRemove;
 
   // 重命名：唤起重命名输入（value 取当前显示名）；输入过程中 renameSeq 递增驱动即时刷新
   const startRename = useCallback((_index: number, img: GalleryImage) => {
@@ -740,10 +1155,17 @@ function SwiperLoopCarousel({
   // 构建功能插槽：调用方提供的 actions 完全控制顺序/启停/图标/函数；
   // 未提供时使用内置默认（重命名 → 删除）。内置 delete/rename 的本地行为始终执行，
   // 其 onSelect 仅用于追加调用方真实逻辑。
-  const actionsConfig: CarouselAction[] = actions ?? [
+  // 调用方可能只给 key/label（如预览页示例未提供 icon），此处为内置动作补全默认图标，
+  // 避免按钮因无图标而渲染为空、不可见。
+  const actionsConfig: CarouselAction[] = (actions ?? [
     { key: "rename", icon: RenameIcon, label: t.renameImage },
     { key: "delete", icon: TrashIcon, label: t.deleteImage },
-  ];
+  ]).map((a) => {
+    if (a.icon) return a;
+    if (a.key === "rename") return { ...a, icon: RenameIcon };
+    if (a.key === "delete") return { ...a, icon: TrashIcon };
+    return a;
+  });
 
   // ── 虚拟化 ──
   // 图片数量超过阈值时启用 Swiper Virtual 模式，只渲染可见 slides，避免 2000 个 DOM 节点
@@ -752,9 +1174,22 @@ function SwiperLoopCarousel({
 
   // ── 导航锁定 ──
   // 图片数量不足以切换时，禁止所有导航（键盘、按钮、拖拽、点击、Swiper 滑动）
-  const isNavigationLocked = (n === 2 && viewMode === 2) || (n === 3 && viewMode === 3);
+  const isNavigationLocked = n === 0 || viewMode >= n;
   const isNavigationLockedRef = useRef(isNavigationLocked);
   useEffect(() => { isNavigationLockedRef.current = isNavigationLocked; }, [isNavigationLocked]);
+
+  // 按图片数量自动收敛视图模式：当前模式需要的图片张数超过剩余张数时，自动降级到可行模式。
+  // 降级复用 changeViewMode 的全套过渡动画（isTransitioningViewMode 驱动），与手动切换观感一致。
+  // - n===2：若当前为三图 → 自动切到双图；双图下 viewMode>=n 导航已由 isNavigationLocked 锁定；
+  // - n===1：若当前为双图/三图 → 自动切到单图，单图下 viewMode>=n 导航同样锁定；
+  // - n===0：无可用视图，直接由空占位接管，不触发生成任何模式。
+  useEffect(() => {
+    if (!isOpen) return;
+    const maxAllowed: 1 | 2 | 3 = n >= 3 ? 3 : n === 2 ? 2 : 1;
+    if (n > 0 && viewMode > maxAllowed) {
+      changeViewMode(maxAllowed);
+    }
+  }, [isOpen, n, viewMode, changeViewMode]);
 
   // 导航锁定时禁用 Swiper 触摸滑动
   useEffect(() => {
@@ -771,7 +1206,7 @@ function SwiperLoopCarousel({
   // ── goToIndex ──
 
   const goToIndex = useCallback(
-    (idx: number) => {
+    (idx: number, opts?: { keepPendingIndex?: boolean }) => {
       if (isNavigationLockedRef.current) return;
       const swiper = swiperRef.current;
       if (!swiper || swiper.destroyed) return;
@@ -817,8 +1252,26 @@ function SwiperLoopCarousel({
         // realIndex 必须同步提交：Swiper virtual 模式在 slideTo 的过渡回调里依赖
         // React 同步反映最新索引来填充/重排 slides，若异步化（startTransition）会
         // 导致 transform 不更新、切换无动画甚至不切换。故这里保持同步。
+        // 同步标记滑动过渡开始：goToIndex 是箭头/上一张/下一张/缩略图/滚轮导航的汇聚点，
+        // 且经 jumpTargetRef 抑制了 handleSlideChange（那里的标记不会执行）。
+        // 必须在 setRealIndex 同一批提交，否则 realIndex 先变让旧中心被判非活跃、被
+        // neighborHidden 隐藏，而 wrapper 还没开始平移动画 → 旧图原地消失的黑屏一帧。
+        setIsSwipeAnimating(true);
         setRealIndex(idx);
         realIndexRef.current = idx;
+        // keepPendingIndex（行首删除）：只驱动切换动画与 realIndex 前进，但保持 pendingRealIndex 不变。
+        // 此时缩略图条中心不该跳去 R+1 又跳回 R（删除前后中心始终在同一索引位），避免底部缩略图往返二次动画。
+        // 需同步抑制 handleSlideChange 的 pendingRealIndex 写入（swiper.slideTo(R+1) 会触发 slideChange），
+        // 否则缩略图条仍会被 0→1→0 拉动两次。
+        if (opts?.keepPendingIndex) {
+          suppressPendingSyncRef.current = true;
+          // 复位：keepPendingIndex 只在删除动画窗口内抑制 handleSlideChange 对
+          // pendingRealIndex 的同步，窗口结束后必须复位，否则后续导航的缩略图条中心不再跟随。
+          window.setTimeout(() => {
+            suppressPendingSyncRef.current = false;
+          }, RESET_SUPPRESS_MS);
+          return;
+        }
         // pendingRealIndex 也必须同步：缩略图条中心/移动目标(STRIP_TARGET_X)依赖它，
         // 异步化会导致长按/连续点击时缩略图条不跟手、帧率下降。
         pendingRealIndexRef.current = idx;
@@ -856,6 +1309,13 @@ function SwiperLoopCarousel({
   // 覆盖 goToIndex 已设的目标索引，打断目标图片的预加载入队（abort 风暴）。
   // 记录目标索引，handleSlideChange 在到达目标前忽略中间索引，到达后清除。
   const jumpTargetRef = useRef<number | null>(null);
+
+  // 行首删除(keepPendingIndex)期间：goToIndex 会驱动 swiper.slideTo(R+1) 触发 slideChange，
+  // 而 handleSlideChange 会无条件把 pendingRealIndex 刷成 R+1，随后删除收缩时又改回 R，
+  // 导致底部缩略图条 0→1→0 往返两次 spring，表现为抽搐。
+  // 该 flag 在 keepPendingIndex 期间抑制 handleSlideChange 对 pendingRealIndex 的同步，
+  // 仅同步 realIndex（A 坐标推进仍需要），由 canSlide 分支的 460ms 收缩回调复位。
+  const suppressPendingSyncRef = useRef(false);
 
   // 用 ref 跟踪 viewMode，避免 processArrowRelease 闭包过期
   const viewModeRef = useRef(viewMode);
@@ -2033,6 +2493,12 @@ function SwiperLoopCarousel({
   }, []);
   const handleSlideChange = useCallback((s: SwiperClass) => {
     if (s.destroyed) return;
+    // canSlide 删除的 Swiper 复位期间：整体忽略 slideChange（slideToLoop 中间循环位会
+    // 短暂拨动 realIndex，导致幸存活跃卡 isActive 闪断并在复位后重放二次入场）。
+    if (suppressRealIndexSyncRef.current) return;
+    // 复位后 rAF 延迟的 slideChange（slideToLoop 内部经 requestAnimationFrame 执行 slideTo、
+    // loopFix 也可能连锁再拨动一次）：在抑制窗口内同样忽略，避免把 realIndex 拨到中间值。
+    if (performance.now() < resetSuppressUntilRef.current) return;
     if (isViewModeChangingRef.current) return;
     const newIdx = s.realIndex;
     // 跳转（goToIndex）期间：忽略 slideTo 长距离滑动逐个经过的中间 slide，
@@ -2059,7 +2525,15 @@ function SwiperLoopCarousel({
       }
       return diff > 0 ? 1 : -1;
     })();
+    // 必须在 setRealIndex 之前同步标记滑动过渡开始：realIndex 变化会让退出图在下一帧被判为
+    // 非活跃，若只等 onSlideChangeTransitionStart 再开 isSwipeAnimating，图片位移前那 1~2 帧里
+    // 退出图会被 neighborHidden 隐藏（仍停在中心却被隐藏 → 黑屏一闪）。两个 setState 同一 handler
+    // 内提交，退出图从"仍是中心"到"开始左移"全程不会出现隐藏间隙。
+    setIsSwipeAnimating(true);
     setRealIndex(newIdx);
+    // 行首删除(keepPendingIndex)期间：pendingRealIndex 须保持不变（仍为 R），
+    // 避免 slideChange 把它刷成 R+1 后 460ms 收缩回调又改回 R，造成缩略图条往返抽搐。
+    if (suppressPendingSyncRef.current) return;
     // pendingRealIndex 保持同步：缩略图条中心/移动目标依赖它，异步化导致不跟手
     setPendingRealIndex(newIdx);
     pendingRealIndexRef.current = newIdx;
@@ -2072,7 +2546,7 @@ function SwiperLoopCarousel({
   // 退出动画期间保留缓存，避免触发 AnimatedSlideImg 的退出动画与 overlay 淡出叠加
   const activeIndicesCacheRef = useRef<Set<number>>(new Set<number>());
   const activeIndices = useMemo(() => {
-    if (!isOpen) return activeIndicesCacheRef.current;
+    if (!isOpen || n === 0) return activeIndicesCacheRef.current;
     const s = new Set<number>();
     for (let offset = 0; offset < viewMode; offset++) {
       s.add((realIndex + offset) % n);
@@ -2086,7 +2560,7 @@ function SwiperLoopCarousel({
   const SWIPER_RENDER_RANGE = 5;
   const nearActiveSetCacheRef = useRef<Set<number>>(new Set<number>());
   const nearActiveSet = useMemo(() => {
-    if (!isOpen) return nearActiveSetCacheRef.current;
+    if (!isOpen || n === 0) return nearActiveSetCacheRef.current;
     const s = new Set<number>();
     for (let offset = -SWIPER_RENDER_RANGE; offset < SWIPER_RENDER_RANGE + viewMode; offset++) {
       s.add(((realIndex + offset) % n + n) % n);
@@ -2099,14 +2573,21 @@ function SwiperLoopCarousel({
   // 即使 Swiper loopFix 移动 DOM 导致组件重新挂载，也能获得正确的"上一次 isActive"值
   const prevActiveIndicesRef = useRef<Set<number>>(new Set<number>());
   const everRenderedSetRef = useRef<Set<number>>(new Set<number>());
+  // 各滑片下标当前"占据者" img.id：删除导致索引重排换图时，同一滑片应视为"未曾活跃"，
+  // 从而为新占据者触发入场动画（否则 wasActive 沿用旧图的历史，新图会瞬跳无动画）
+  const indexOccupantRef = useRef<Map<number, number>>(new Map());
   const wasActiveMap = useMemo(() => {
     const map = new Map<number, boolean | undefined>();
+    const occupant = indexOccupantRef.current;
     for (const index of nearActiveSet) {
+      const occupantId = images[index]?.id ?? index;
+      const occupantChanged = occupant.get(index) !== occupantId;
       if (everRenderedSetRef.current.has(index)) {
-        // 之前渲染过：提供准确的 wasActive 值
-        map.set(index, prevActiveIndicesRef.current.has(index));
+        // 之前渲染过：若占据者换过图则视为"未曾活跃"（新图据此入场），否则沿用上一次 isActive
+        map.set(index, occupantChanged ? false : prevActiveIndicesRef.current.has(index));
       }
       // 之前没渲染过：不设置，wasActiveMap.get(index) 返回 undefined
+      occupant.set(index, occupantId);
     }
     // 更新已渲染集合
     for (const index of nearActiveSet) {
@@ -2114,7 +2595,7 @@ function SwiperLoopCarousel({
     }
     prevActiveIndicesRef.current = activeIndices;
     return map;
-  }, [activeIndices, nearActiveSet]);
+  }, [activeIndices, nearActiveSet, images]);
 
   // 占位 slide：一次性创建空 SwiperSlide，延迟到 overlay 打开时创建
   // 退出动画期间保留缓存，避免 Swiper 收到空子元素触发大量内部更新
@@ -2144,6 +2625,9 @@ function SwiperLoopCarousel({
   // 创建单个 slide 的内容（提取为函数，Virtual 和非 Virtual 模式共用）
   const renderSlideInner = useCallback((index: number) => {
     const img = images[index];
+    // 全部删除后 overlay 关闭前的一瞬 n 可能为 0，或 %0 使 nearActiveSet 产生 NaN/Fractional 下标：
+    // 该下标无对应图片时返回空占位，避免访问 img.thumbSrc 崩溃。
+    if (!img) return { node: <div data-img-index={index} />, slideClassName: "", overflowClip: false };
     // 并发预加载：范围内图片就绪前用缩略图兜底，分块完成后无缝替换为 blob URL；
     // 范围外图片保持原生 lazy 加载原始 src，避免与预加载产生双份下载。
     const readySrc = preloader.getReadySrc(index);
@@ -2153,7 +2637,15 @@ function SwiperLoopCarousel({
     const displaySrc = readySrc ?? (img.thumbSrc || img.src);
     // 当前活跃图（单图=中心，双图/三图/多图=全部可见图）：任一原图尚未就绪时都稳定显示转圈，
     // 而非仅 index===realIndex 的第一张，保证所有共视图加载进度一致可见
-    const showSpinner = activeIndices.has(index) && !Boolean(readySrc);
+    // 切换/视图过渡动画进行中（inMove）不显示转圈：此时缩略图兜底在飞入，叠加转圈会破坏入场观感；
+    // 仅当缩略图都未就绪（连续快速点击、缩略图还没加载出来）时才以转圈作占位。
+    // 动画结束后（!inMove）缩略图无论是否就位都恢复转圈提示（原图加载中）。
+    const inMove = isSwipeAnimating || isTransitioningViewMode;
+    const thumbReady = Boolean(img.thumbSrc) && thumbLoadedRef.current.has(img.thumbSrc);
+    const showSpinner =
+      activeIndices.has(index) &&
+      !Boolean(readySrc) &&
+      (!inMove || !thumbReady);
     // 该图原图下载进度：total 已知时用真实百分比驱动进度环；未知（如关闭分块的整块下载/尚未开始）回退为转圈
     const prog = preloader.getProgress(img.src);
     const progressKnown = Boolean(prog && prog.total > 0);
@@ -2196,6 +2688,11 @@ function SwiperLoopCarousel({
     const viewModeOffsetX = 0;
     const slideWidth = containerWidth / viewMode;
     const entryAnimXOffset = slideWidth > 0 ? slideWidth * 0.6 : 60;
+    // 删除平移动画：右侧幸存图平移到被删图让出的槽位，起始偏移＝一格槽距（槽宽＋槽缝），
+    // 从"原位置"无缝滑入新位置（正好左移一格）
+    const slotGap = viewMode > 1 ? 8 : 0;
+    const slotW = containerWidth > 0 ? (containerWidth - (viewMode - 1) * slotGap) / viewMode : containerWidth;
+    const deleteTranslateX = slotW + slotGap;
     const viewModeZIndex = (() => {
       if (!isTransitioningViewMode) return undefined;
       if (relIdx < prevVM) return 2;
@@ -2203,6 +2700,58 @@ function SwiperLoopCarousel({
       return undefined;
     })();
     const isActive = activeIndices.has(index);
+    // 删除是否发生在当前活跃行内（被删图落在 [realIndex, realIndex+viewMode)）。
+    // 仅此场景需要右侧幸存图左移补位；删除活跃行之外的图走 realIndex 前移，不在此列。
+    const deletedInActiveRow =
+      lastDeletedIndexRef.current >= 0 &&
+      lastDeletedIndexRef.current >= realIndex &&
+      lastDeletedIndexRef.current < realIndex + viewMode;
+    // 删除窗口（重排前）：被删图右侧"整段"图（index > lastDeleted）绑定同一个共享 groupShiftX，
+    // 一次性平滑左移一格补位（源码级，多卡由同一动画源驱动零失步）；被删图左侧图不绑定 → 原地不动。
+    // 重排后（deletingReshapedRef）rider 位移必须与数组缩水同一 commit 解除绑定：
+    // removeEpoch 提交时 images 已把被删图移除、下标左移一格（原图1→新0、原图2→新1、原图3→新2），
+    // 各卡"可视化被左移一格后落点"恰好等于其重排后的新槽位。若这里还保留 groupShiftX=-一格 的旧位移
+    // （groupShiftX 要到 runReset 才归零），会在这个 commit 之后的帧里叠加一格外移 → 槽0被原槽1的
+    // 幸存图盖上形成叠影、槽2被再后一张图占据（"新入图的下一张"闪烁）。故 rider 必须 gate
+    // !deletingReshapedRef，让这段位移与该 commit 同帧松开；因数组已同 commit 缩水，绝不回弹——
+    // "被删图已移除、rider 又弹回原位"的前提不可能成立。解绑不影响 lastDeletedIndexRef，
+    // deleteFillTarget 的"已静置不再入场"抑制仍由它维持。
+    const groupShiftOn =
+      isOpen &&
+      !deletingReshapedRef.current &&
+      deletedInActiveRow &&
+      lastDeletedIndexRef.current >= 0;
+    // 右侧整段（含被删图右侧幸存图、进入的新图）；被删图自身除外（它走自定义缩小飞出动画）。
+    const rider = groupShiftOn && index > lastDeletedIndexRef.current;
+    // 历史逐卡"左移补位"已由共享平移 groupShiftX 取代，恒为关闭（右侧由同一共享值统一驱动）。
+    const deleteShiftActive = false;
+    // 重排后装到新槽位的右幸存图（按 img.id 记，跨重挂载稳定）：对象已就地完成左移补位，
+    // 重挂载后静置到位，不再重放进场/补位动画（避免"闪一下再位移"）。
+    // 用"静置时刻新鲜度"判定：时间戳在重排提交时刷新，窗口（DELETE_FILL_VALID_MS）内
+    // 重挂载/抖动的幸存卡仍按已静置处理，窗口外自然失效，恢复正常入场判定。
+    const fillSettledAt = relocateFillIdsRef.current.get(img.id);
+    const deleteFillTarget =
+      isOpen &&
+      lastDeletedIndexRef.current >= 0 &&
+      fillSettledAt != null &&
+      performance.now() - fillSettledAt < DELETE_FILL_VALID_MS;
+    // 仅"右幸存图"（非 incoming）：重排后已就地移动到位，顶部名称/功能按钮栏重挂载时跳过入场淡入，
+    // 避免"平移到位了名称又加载一遍"。incoming 是真·新图，重排后变活跃时名称栏仍正常淡入。
+    const survivorSettledAt = relocateSurvivorFillIdsRef.current.get(img.id);
+    const deleteSurvivorFillTarget =
+      isOpen &&
+      lastDeletedIndexRef.current >= 0 &&
+      survivorSettledAt != null &&
+      performance.now() - survivorSettledAt < DELETE_FILL_VALID_MS;
+    // 删除窗口（重排前）：从右侧进入新末位的下一张图（index === realIndex+viewMode，非活跃）做
+    // 与纯"切换下一张"入场逐点同源的"缩放+淡入+飞入"；其横向"左移一格落位"已由共享 groupShiftX
+    // 承担（本卡同时是右侧 rider），故这里只驱动入场视觉(scale/opacity/entryX +0.6格→0)。
+    // 重排后(realIndex+viewMode 下标已被后图占据)该卡自然不再命中，静置由 deleteFillTarget 接管。
+    const deleteEntryTarget =
+      isOpen &&
+      !deletingReshapedRef.current &&
+      deletedInActiveRow &&
+      index === realIndex + viewMode;
     // 该图当前是否被缩放/拖拽而贴到滑片边界。是则给图片施加边缘淡出遮罩，
     // 让贴边/即将被裁剪的部分呈现半透明软过渡，而非一条生硬的裁剪线。
     // 滑片仍保持 overflow-hidden，各图片不会拖进相邻图片。
@@ -2218,8 +2767,11 @@ function SwiperLoopCarousel({
     const inRow = (index - realIndex + n) % n < viewMode;
     // 横向只裁"朝向相邻图片"的那一侧；朝外一侧用负值 inset 不裁（上下始终不裁、全透）。
     // 首张：只裁右（左透）；末张：只裁左（右透）；中间：左右都裁；单图：全部不裁。
+    // 删除窗口内就地移动的图（左移补位的幸存图 / 标准入场的下一张）一律不裁：
+    // 它们的位移会越过自身槽位边界，若保持 clip-path 会"越过中线的像素被裁掉"。
     let horizontalClip: string | undefined;
-    if (viewMode === 1) {
+    if (viewMode === 1 || rider) {
+      // rider（右侧整段共享平移）位移会越过自身槽位边界，必须放开裁剪，否则越过中线的像素被裁掉
       horizontalClip = undefined;
     } else {
       const clipLeft = inRow ? !isFirstInRow : true;
@@ -2230,14 +2782,30 @@ function SwiperLoopCarousel({
         horizontalClip = `inset(-9999px ${R} -9999px ${L})`;
       }
     }
+    // 溢出透图时隐藏非活跃相邻图：窄屏下 canvas 宽度小，相邻滑片会有一部分落到屏幕边缘，
+    // 若不隐藏会从半透明"框架"区域直接看到左右两张邻图。
+    // 例外一：正在被删除的图（删除飞出动画期间）即使已非活跃也保持可见，否则它的向上飞出效果会被隐藏。
+    // 例外二：视图切换转场中（isTransitioningViewMode）要放行退出动画的可见性，不在此隐藏；
+    //        三图/双图切换完成（转场结束）后再隐藏非活跃邻图，杜绝"第一张左边 / 第三张右边
+    //        看到别的图片边缘"——因为容器/Swiper 现在恒 overflow:visible，邻图会透过半透明
+    //        框架边缘露出来。
+    // 例外三：普通滑动过渡中（isSwipeAnimating）要放行正在退出/进入的邻图可见性，不在此隐藏；
+    //        过渡结束回到空闲后再隐藏非活跃邻图。否则切换时左边的图从飞出一开始就被隐藏，
+    //        用户看不到它向左侧飞出（症状：切换只剩新图淡入，旧图消失于无形）。
+    // 例外四：删除窗口内"从右侧进入新末位的下一张图"（deleteEntryTarget）非活跃却要播放与切换
+    //        相同的"缩放+淡入+飞入"，若被此处隐藏，其飞入全程不可见，重排后静置归位则表现为
+    //        新图"直接出现"而非飞入。故删除期间放行它，保证飞入可见。
+    const neighborHidden =
+      !isActive &&
+      lastDeletedIndexRef.current !== index &&
+      !deleteEntryTarget &&
+      (imgOverflowActive || (!isTransitioningViewMode && !isSwipeAnimating));
     const innerDivStyle: React.CSSProperties = {
       ...(viewModeZIndex != null ? { position: "relative", zIndex: viewModeZIndex } : {}),
       // overflow 全 visible（横/纵都能溢出透出），横向是否被裁完全交给上面的 clip-path
       overflow: "visible",
       ...(horizontalClip ? { clipPath: horizontalClip, WebkitClipPath: horizontalClip } : {}),
-      // 溢出透图时隐藏非活跃相邻图：窄屏下 canvas 宽度小，相邻滑片会有一部分落到屏幕边缘，
-      // 若不隐藏会从半透明"框架"区域直接看到左右两张邻图。
-      ...(imgOverflowActive && !isActive ? { visibility: "hidden" } : {}),
+      ...(neighborHidden ? { visibility: "hidden" } : {}),
     };
     // 该滑片内容（图片+motion）与滑片外壳(overflow 裁剪)拆分：
     // - 非虚拟(小 n)：外壳 = SwiperSlide，内容放其内部
@@ -2287,13 +2855,30 @@ function SwiperLoopCarousel({
               showSpinner={showSpinner}
               downloadProgress={downloadProgress}
               progressKnown={progressKnown}
+              // originalReady：重排后重挂载的"右幸存图"原图早已显示，置 true 让新实例直接以原图
+              // 显示、跳过底层缩略图加载淡入（避免平移到位瞬间闪现缩略图）。
+              // 但"删除窗口内从右侧进入的新图"（deleteEntryTarget）此刻原图可能刚就绪（displaySrc
+              // 从缩略图切到原图）：若也置 true，会提前撤掉底层缩略图、主图 opacity 强制 1，而原图
+              // 尚未解码 → 缩略图与原图之间出现一小段黑屏。该新图应完全复用"切换事件"的加载逻辑
+              // （缩略图常驻底层，等 imgLoaded 后再淡入原图），故排除 deleteEntryTarget。
+              originalReady={Boolean(readySrc) && deleteFillTarget && !deleteEntryTarget}
+              thumbKey={img.thumbSrc}
+              onThumbLoaded={onThumbLoaded}
               viewModeEpoch={viewModeEpoch}
+              deleteEpoch={deleteEpoch}
+              deleteShiftActive={deleteShiftActive}
+              deleteFillTarget={deleteFillTarget}
+              deleteFillSettledAt={fillSettledAt}
+              deleteEntryTarget={deleteEntryTarget}
+              deleteTranslateX={deleteTranslateX}
+              groupShiftX={rider ? groupShiftX : undefined}
               viewModeOffsetX={viewModeOffsetX}
               entryXFrom={entryXFrom}
               entryScaleFrom={entryScaleFrom}
               entryXOffset={entryAnimXOffset}
               slideDirectionRef={slideDirectionRef}
               isExitingOnViewModeChange={isExitingOnViewModeChange}
+              entryX={motionsNow.entryX}
               onExitComplete={() => {
                 const m = imageMotionsMapRef.current.get(index);
                 if (m) {
@@ -2304,33 +2889,54 @@ function SwiperLoopCarousel({
               }}
             />
           </motion.div>
-          {isActive && (
+          {isActive && deletingId !== img.id && (
             <motion.div
-              initial={{ y: -24, opacity: 0 }}
-              animate={{ y: 0, opacity: 1 }}
-              transition={{ duration: 0.35, delay: 0.3, ease: "easeOut" }}
-              className="pointer-events-none absolute top-[calc(56px-20px)] z-10 rounded-full car__ctrl px-3 py-1 text-xs font-medium whitespace-nowrap left-1/2 -translate-x-1/2 sm:left-3 sm:translate-x-0 sm:backdrop-blur-sm"
+              className="pointer-events-none absolute top-[calc(56px-20px)] left-3 right-3 z-10 flex items-center justify-between gap-3"
+              style={{ x: rider ? groupShiftX : 0, willChange: "transform" }}
             >
-              {renderOverlay ? renderOverlay({ image: img, index, total: totalCount, isActive }) : (
-                <>
-                  <span>{index + 1} / {totalCount}</span>
-                  <span className="ml-2" style={{ color: themeTokens.textDim }}>{renamedMapRef.current.get(img.id) ?? img.alt}</span>
-                  {img.dimensions
-                    ? <span className="ml-2" style={{ color: themeTokens.textFaint }}>{img.dimensions}</span>
-                    : (img.width && img.height && <span className="ml-2" style={{ color: themeTokens.textFaint }}>{img.width}×{img.height}</span>)
-                  }
-                  {img.sizeLabel
-                    ? <span className="ml-2" style={{ color: themeTokens.textFaint }}>{img.sizeLabel}</span>
-                    : (img.fileSize != null && <span className="ml-2" style={{ color: themeTokens.textFaint }}>{formatFileSize(img.fileSize)}</span>)
-                  }
+              {/* 名称栏：序号 / 名称 / 尺寸 / 大小。与操作按钮分开，单独成栏。幸存图重排重挂载时跳过入场淡入 */}
+              <motion.div
+                initial={deleteSurvivorFillTarget ? false : { y: -24, opacity: 0 }}
+                animate={{ y: 0, opacity: 1 }}
+                transition={{ duration: 0.35, delay: 0.3, ease: "easeOut" }}
+                className="pointer-events-none min-w-0 rounded-full car__ctrl px-3 py-1 text-xs font-medium whitespace-nowrap sm:backdrop-blur-sm"
+              >
+                {renderOverlay ? renderOverlay({ image: img, index, total: totalCount, isActive }) : (
+                  <>
+                    <span>{index + 1} / {totalCount}</span>
+                    <span
+                      className="ml-2 inline-block truncate align-bottom"
+                      style={{ maxWidth: "min(42vw, 260px)", color: themeTokens.textDim }}
+                    >{renamedMapRef.current.get(img.id) ?? img.alt}</span>
+                    {img.dimensions
+                      ? <span className="ml-2" style={{ color: themeTokens.textFaint }}>{img.dimensions}</span>
+                      : (img.width && img.height && <span className="ml-2" style={{ color: themeTokens.textFaint }}>{img.width}×{img.height}</span>)
+                    }
+                    {img.sizeLabel
+                      ? <span className="ml-2" style={{ color: themeTokens.textFaint }}>{img.sizeLabel}</span>
+                      : (img.fileSize != null && <span className="ml-2" style={{ color: themeTokens.textFaint }}>{formatFileSize(img.fileSize)}</span>)
+                    }
+                  </>
+                )}
+              </motion.div>
+
+              {/* 操作按钮栏：等尺寸方形、自身 flex 水平对齐（下载 / 重命名 / 删除） */}
+              {!renderOverlay && (
+                <motion.div
+                  initial={deleteSurvivorFillTarget ? false : { y: -24, opacity: 0 }}
+                  animate={{ y: 0, opacity: 1 }}
+                  transition={{ duration: 0.35, delay: 0.3, ease: "easeOut" }}
+                  className="pointer-events-auto flex shrink-0 items-center gap-2"
+                >
                   {onDownload && (
                     <button
                       onClick={(e) => { e.stopPropagation(); onDownload(index); }}
-                      className="pointer-events-auto ml-2 inline-flex items-center justify-center"
-                      style={{ color: themeTokens.textDim }}
+                      className="inline-flex items-center justify-center rounded-full car__ctrl transition-transform hover:scale-105 active:scale-95"
+                      style={{ width: 30, height: 30, color: themeTokens.textDim }}
                       aria-label="Download"
+                      title="Download"
                     >
-                      <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                      {DownloadIcon}
                     </button>
                   )}
                   {actionsConfig.map((a) => {
@@ -2346,8 +2952,8 @@ function SwiperLoopCarousel({
                           else if (a.key === "rename") startRename(index, img);
                           a.onSelect?.(ctx);
                         }}
-                        className="pointer-events-auto ml-2 inline-flex items-center justify-center"
-                        style={{ color: disabled ? themeTokens.textFaint : themeTokens.textDim }}
+                        className="inline-flex items-center justify-center rounded-full car__ctrl transition-transform hover:scale-105 active:scale-95"
+                        style={{ width: 30, height: 30, color: disabled ? themeTokens.textFaint : themeTokens.textDim }}
                         aria-label={a.label}
                         title={a.label}
                       >
@@ -2355,24 +2961,26 @@ function SwiperLoopCarousel({
                       </button>
                     );
                   })}
-                </>
+                </motion.div>
               )}
             </motion.div>
           )}
         </div>
     );
     return { node, slideClassName, overflowClip };
-  }, [images, realIndex, n, prevViewMode, viewMode, isTransitioningViewMode, containerWidth, containerHeight, preloader, preloader.version, isPinching, activeIndices, wasActiveMap, viewModeEpoch, slideDirectionRef, getOrCreateImageMotions, renderOverlay, onDownload, imgDraggingIdx, imgOverflowActive, actionsConfig, flyOutAndRemove, startRename, deletingId, renamedMapRef, renameSeq]);
+  }, [images, realIndex, n, prevViewMode, viewMode, isTransitioningViewMode, isSwipeAnimating, containerWidth, containerHeight, preloader, preloader.version, isPinching, activeIndices, wasActiveMap, viewModeEpoch, slideDirectionRef, getOrCreateImageMotions, renderOverlay, onDownload, imgDraggingIdx, imgOverflowActive, actionsConfig, flyOutAndRemove, startRename, deletingId, renamedMapRef, renameSeq, deletingReshapedRef, onThumbLoaded]);
 
   // 非虚拟(<n)：内容包回 SwiperSlide，行为与原来完全一致
   const renderSlideContent = useCallback((index: number) => {
     const { node, slideClassName } = renderSlideInner(index);
+    const occupantId = images[index]?.id ?? index;
     return (
       <SwiperSlide key={index} virtualIndex={index} onClick={(e) => e.stopPropagation()} className={slideClassName}>
-        {node}
+        {/* 内容层带占据者 key：删除换图时重挂载，配合 occupant 感知的 wasActiveMap 触发新图入场 */}
+        <React.Fragment key={`${index}-${occupantId}`}>{node}</React.Fragment>
       </SwiperSlide>
     );
-  }, [renderSlideInner]);
+  }, [renderSlideInner, images]);
 
   // 虚拟(大 n)：内容包进绝对定位分层，盖在 Swiper 空占位滑片之上。
   // 分层经 createPortal 放进 .swiper-wrapper，继承其 transform，切图时仅重渲染近活跃窗口。
@@ -2384,15 +2992,18 @@ function SwiperLoopCarousel({
   const renderVirtualOverlaySlide = useCallback((index: number) => {
     const { node, overflowClip } = renderSlideInner(index);
     const left = index * (virtualCellW + virtualSpaceBetween);
+    // key 带上占据者 img.id：删除后同一滑片换了图会重挂载，配合 occupant 感知的
+    // wasActiveMap 让"顶替进来的新图"重新走入场动画（否则主图切换无动画且可能一帧闪烁）
+    const occupantId = images[index]?.id ?? index;
     return (
       <div
-        key={index}
+        key={`${index}-${occupantId}`}
         style={{ position: "absolute", top: 0, left, width: virtualCellW, height: "100%", overflow: overflowClip ? "hidden" : "visible" }}
       >
         {node}
       </div>
     );
-  }, [renderSlideInner, virtualCellW, virtualSpaceBetween]);
+  }, [renderSlideInner, virtualCellW, virtualSpaceBetween, images]);
 
   // 活跃 slide：统一使用浅拷贝占位 + 只替换 nearActiveSet 中的项
   // 避免 images.map() 全量创建 React Element（1000+ 张时每次切图都要重建）
@@ -2443,6 +3054,7 @@ function SwiperLoopCarousel({
     const activeScale = isKeyboardActive ? 1 : (viewMode === 1 ? CENTER_SCALE : viewMode === 2 ? 1.15 : 1.1);
     const stripHeight = viewMode === 1 ? HIGHLIGHT_CENTER_WIDTH : CENTER_THUMB_SIZE;
     const cache = stripItemCacheRef.current;
+    const newPositions = new Map<number, number>();
     const items = [];
     for (let i = startIdx; i <= endIdx; i++) {
       const img = images[i];
@@ -2451,6 +3063,11 @@ function SwiperLoopCarousel({
       // 双图模式额外间距
       const extraLeft = viewMode === 2 && active && i === thumbActiveTarget + 1 ? DUAL_HIGHLIGHT_EXTRA_GAP : 0;
       const offsetX = i * (THUMB_SIZE + THUMB_GAP) + extraLeft;
+      const oldOffsetX = thumbPositionsRef.current.get(img.id);
+      // 删除后索引重排：此项从 oldOffsetX 移到新 offsetX，差值作为挂载动画起点（FLIP 靠拢）
+      const animOffsetX = oldOffsetX == null ? 0 : oldOffsetX - offsetX;
+      const isDeleting = deletingId === img.id;
+      newPositions.set(img.id, offsetX);
       const cached = cache.get(i);
       if (
         cached &&
@@ -2458,14 +3075,18 @@ function SwiperLoopCarousel({
         cached.props.active === active &&
         cached.props.offsetX === offsetX &&
         cached.props.activeScale === activeScale &&
-        cached.props.stripHeight === stripHeight
+        cached.props.stripHeight === stripHeight &&
+        cached.props.animOffsetX === animOffsetX &&
+        cached.props.isDeleting === isDeleting
       ) {
         items.push(cached);
         continue;
       }
+      // key 仅用 img.id（稳定）：删除导致索引重排时，缩略图不重挂载，
+      // 仅靠 animOffsetX 的 FLIP 平滑移位，避免"整页+缩略图闪烁"。
       const el = (
         <ThumbnailItem
-          key={i}
+          key={img.id}
           img={img}
           idx={i}
           active={active}
@@ -2473,17 +3094,21 @@ function SwiperLoopCarousel({
           onThumbClick={handleThumbClick}
           stripHeight={stripHeight}
           offsetX={offsetX}
+          animOffsetX={animOffsetX}
+          isDeleting={isDeleting}
         />
       );
       cache.set(i, el);
       items.push(el);
     }
+    // 更新位置表（供下一次删除靠拢计算）；同时清理已离开窗口/已被删除的旧记录
+    thumbPositionsRef.current = newPositions;
     // 清理窗口外的缓存项，防止缓存无限增长
     for (const key of Array.from(cache.keys())) {
       if (key < startIdx - 2 || key > endIdx + 2) cache.delete(key);
     }
     return { items };
-  }, [realIndex, isKeyboardActive, pendingRealIndex, viewMode, n, handleThumbClick, isStripDragging, stripDragVisibleIdx, images]);
+  }, [realIndex, isKeyboardActive, pendingRealIndex, viewMode, n, handleThumbClick, isStripDragging, stripDragVisibleIdx, images, deletingId]);
 
   return (
     <AnimatePresence>
@@ -2532,6 +3157,27 @@ function SwiperLoopCarousel({
           transition={{ duration: 0.25 }}
         >
           <style dangerouslySetInnerHTML={{ __html: carThemeStyles }} />
+
+          {/* 空状态：图片删干净时显示占位文案（主题适配 + i18n） */}
+          {n === 0 && (
+            <div
+              className="pointer-events-none absolute inset-0 z-[40] flex flex-col items-center justify-center gap-3"
+              onClick={(e) => e.stopPropagation()}
+              style={{ paddingTop: CANVAS_EDGE_PX }}
+            >
+              <div
+                className="h-12 w-12 rounded-xl car__placeholder"
+                style={{ display: "flex", alignItems: "center", justifyContent: "center" }}
+              >
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <rect x="3" y="5" width="18" height="14" rx="2" stroke={themeTokens.textFaint} strokeWidth="1.5" />
+                  <path d="M3.5 16l4.5-4.5 3.5 3.5 4-4 5 5" stroke={themeTokens.textFaint} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </div>
+              <span className="text-sm font-medium" style={{ color: themeTokens.textDim }}>{t.emptyGallery}</span>
+            </div>
+          )}
+
           <div
             ref={containerRef}
             className="relative flex items-center justify-center overflow-hidden"
@@ -2551,9 +3197,18 @@ function SwiperLoopCarousel({
               speed={400}
               onSwiper={handleSwiperInit}
               onSlideChange={handleSlideChange}
+              onSlideChangeTransitionStart={() => setIsSwipeAnimating(true)}
+              onSlideChangeTransitionEnd={() => setIsSwipeAnimating(false)}
               className={`absolute inset-0 h-full w-full${isTransitioningViewMode ? " !overflow-visible" : ""}`}
               wrapperClass="swiper-wrapper h-full min-h-0"
-              style={{ overflow: "visible" }}
+              style={
+                {
+                  overflow: "visible",
+                  // 与 AnimatedSlideImg 入场动画的 easeOut(cubic-bezier(0,0,0.58,1)) 对齐，
+                  // 使"切换下一张"与"删除补位"的飞入轨迹逐帧一致（wrapper 缓动 ≠ easeOut 时中段会错位）
+                  "--swiper-wrapper-transition-timing-function": "cubic-bezier(0, 0, 0.58, 1)",
+                } as React.CSSProperties
+              }
             >
               {/* 虚拟(大 n)：Swiper 只拿"稳定的空占位 children"，切图不再触发其全量 getChildren/协调 */}
               {useVirtual ? placeholderSlides : slides}
@@ -2679,22 +3334,7 @@ function SwiperLoopCarousel({
                 viewMode,
                 density: stripDensityLevel,
                 setViewMode: (mode: 1 | 2 | 3) => {
-                  if (mode === viewMode) return;
-                  preViewModeIndexRef.current = realIndexRef.current;
-                  prevViewModeRef.current = viewMode;
-                  setPrevViewMode(viewMode);
-                  const s = swiperRef.current;
-                  if (s && !s.destroyed) {
-                    const wrapper = s.wrapperEl as HTMLElement;
-                    wrapper.style.transition = "none";
-                    const currentTransform = window.getComputedStyle(wrapper).transform;
-                    wrapper.style.transform = currentTransform;
-                    s.params.speed = 0;
-                  }
-                  isViewModeChangingRef.current = true;
-                  setIsTransitioningViewMode(true);
-                  setViewMode(mode);
-                  setViewModeEpoch((e) => e + 1);
+                  changeViewMode(mode);
                 },
                 setDensity: setStripDensityLevel,
                 goToIndex,
@@ -2838,21 +3478,7 @@ function SwiperLoopCarousel({
                                 disabled={isDisabled}
                                 onClick={() => {
                                   if (isDisabled || mode === viewMode) { setOpenMenu(null); return; }
-                                  preViewModeIndexRef.current = realIndexRef.current;
-                                  prevViewModeRef.current = viewMode;
-                                  setPrevViewMode(viewMode);
-                                  const s = swiperRef.current;
-                                  if (s && !s.destroyed) {
-                                    const wrapper = s.wrapperEl as HTMLElement;
-                                    wrapper.style.transition = "none";
-                                    const currentTransform = window.getComputedStyle(wrapper).transform;
-                                    wrapper.style.transform = currentTransform;
-                                    s.params.speed = 0;
-                                  }
-                                  isViewModeChangingRef.current = true;
-                                  setIsTransitioningViewMode(true);
-                                  setViewMode(mode);
-                                  setViewModeEpoch((e) => e + 1);
+                                  changeViewMode(mode);
                                   setOpenMenu(null);
                                 }}
                                 className={`relative flex h-6 items-center justify-center rounded-lg text-[10px] font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--car-ring)] whitespace-nowrap px-4 ${
@@ -3097,3 +3723,4 @@ export default function SwiperLoopCarouselWithErrorBoundary({
     </CarouselErrorBoundary>
   );
 }
+

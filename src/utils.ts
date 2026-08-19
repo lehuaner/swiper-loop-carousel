@@ -58,6 +58,9 @@ export interface ImageMotions {
   x: MotionValue<number>;
   y: MotionValue<number>;
   scale: MotionValue<number>;
+  /** 入场/删除补位时的水平位移（由 AnimatedSlideImg 内部驱动）；与顶部名称/功能按钮栏共享，
+   *  使名称按钮栏在删除补位时与图片同步平移。 */
+  entryX: MotionValue<number>;
 }
 
 export interface PreloadedDims {

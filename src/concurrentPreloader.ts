@@ -135,6 +135,10 @@ export class ConcurrentPreloader {
 
   setImages(images: { src: string }[]) {
     this.urls = images.map((i) => i.src);
+    // 图片列表变化（含删除后索引左移）会让旧的"索引→URL"缓存 knownIdx 指向已删除/错位的图，
+    // 导致 getSrc(idx) 按 knownIdx 返回已删除图的 blob，渲染出"删除位残留旧图"。
+    // 索引映射一律以最新的 urls 为准，故清空 knownIdx 让它回落到 urls[idx]。
+    this.knownIdx.clear();
   }
 
   configure(options: PreloadOptions) {
@@ -399,7 +403,8 @@ export class ConcurrentPreloader {
           this.evictCache();
         }
         this.results.set(url, { url, idx: item.idx, src, w, h, strategy, errored: w <= 0 || h <= 0 });
-        this.knownIdx.set(item.idx, url);
+        // 仅当该索引当前仍指向同一 url 时才登记，避免删除导致的旧索引残留
+        if (this.urls[item.idx] === url) this.knownIdx.set(item.idx, url);
       } else {
         // CORS 拒绝 / 网络错误 / 关闭并发：退回原生整图加载
         const dims = await this.loadNative(url, signal);
@@ -416,7 +421,8 @@ export class ConcurrentPreloader {
           strategy,
           errored: dims.w <= 0 || dims.h <= 0,
         });
-        this.knownIdx.set(item.idx, url);
+        // 仅当该索引当前仍指向同一 url 时才登记，避免删除导致的旧索引残留
+        if (this.urls[item.idx] === url) this.knownIdx.set(item.idx, url);
       }
       item.state = "done";
       // 仅在图片真正就绪（src 可替换）时通知，触发一次全局重渲染换 src；

@@ -220,8 +220,17 @@ export function useImagePreloader(images: GalleryImage[], options?: PreloadOptio
     });
   }, []);
 
+  // 记录上一次喂给预加载器的列表引用，仅当列表真正变化时才额外触发一次重渲染，
+  // 让 Carousel 用"已对齐新 urls 的 getReadySrc"重算 slides（删除后索引左移时尤其需要）。
+  const lastSetImagesRef = useRef(images);
   useEffect(() => {
     preloader.setImages(images);
+    if (lastSetImagesRef.current !== images) {
+      lastSetImagesRef.current = images;
+      // url→索引映射已随 setImages 清空并回落到新 urls，必须重渲染，否则本轮
+      // getReadySrc 仍按旧 knownIdx 返回已删除图的 blob，删除位残留旧图一小段时间。
+      setVersion((v) => v + 1);
+    }
   }, [preloader, images]);
 
   useEffect(() => {
