@@ -726,6 +726,18 @@ function SwiperLoopCarousel({
   const [isKeyboardActive, setIsKeyboardActive] = useState(false);
   const isKeyboardActiveRef = useRef(false);
   useEffect(() => { isKeyboardActiveRef.current = isKeyboardActive; }, [isKeyboardActive]);
+  // ===== Dev 调试控制面板（仅非生产构建生效；生产构建 process.env.NODE_ENV === 'production'
+  // 使 `isDev && ...` 的浮层 JSX 整体被 DCE 排除，状态恒为默认值零开销）=====
+  const isDev = process.env.NODE_ENV !== "production";
+  const [devPanelOpen, setDevPanelOpen] = useState(false);
+  // 隐藏底部缩略图条
+  const [devHideThumbs, setDevHideThumbs] = useState(false);
+  // 关闭"被删除图片"的飞出/吸入动画（改为瞬时移除）
+  const [devDisableDeleteAnim, setDevDisableDeleteAnim] = useState(false);
+  // 关闭"右侧幸存图"的补位平移动画（改为瞬时落位）
+  const [devDisableSurvivorAnim, setDevDisableSurvivorAnim] = useState(false);
+  // 隐藏主图（大图本身）
+  const [devHideMainImage, setDevHideMainImage] = useState(false);
   // 用于检测 isKeyboardActive 是否刚从 true→false（长按松开），避免挂载时误触恢复逻辑
   const prevHoldRef = useRef(false);
   const [pendingRealIndex, setPendingRealIndex] = useState(0);
@@ -1009,7 +1021,10 @@ function SwiperLoopCarousel({
         animate(m.opacity, 0, { duration: 0.4, ease: "easeIn" });
         animate(m.rotate, 14, { duration: 0.4, ease: [0.55, 0, 1, 0.45] });
       };
-      if (effTarget && effImgEl && effImgEl.isConnected) {
+      // Dev: 关闭"被删图"动画 → 瞬间隐藏 DOM（后续仍走 460ms 重排移除）。
+      if (devDisableDeleteAnim) {
+        m.opacity.set(0);
+      } else if (effTarget && effImgEl && effImgEl.isConnected) {
         requestAnimationFrame(() => {
           if (effImgEl.isConnected) {
             // 被删图若已被缩放/拖拽到超滑片边界：把吸入卡片 clamp 到"其所在滑片可见区"，
@@ -1033,21 +1048,23 @@ function SwiperLoopCarousel({
       }
 
       // ===== 缩略图条：被删缩略图右侧整段同帧左移一格（与飞出/主图右侧段同步） =====
-      // 不论删除发生在哪（活跃行内/外），缩略图条中被删图右侧的缩略图都要左移一格合并。
       // 用一个共享 thumbGroupShiftX（0 → -一格槽距）驱动，重排时归零，绝无回弹。
-      thumbGroupShiftAnimRef.current?.stop();
-      thumbGroupShiftAnimRef.current = animate(
-        thumbGroupShiftX,
-        -(THUMB_SIZE + THUMB_GAP),
-        { duration: 0.4, ease: "easeOut" }
-      );
+      // Dev: devDisableSurvivorAnim 时关闭"幸存图补位平移动画"（缩略图条与主图右侧整段都不平移，瞬时落位）。
+      if (!devDisableSurvivorAnim) {
+        thumbGroupShiftAnimRef.current?.stop();
+        thumbGroupShiftAnimRef.current = animate(
+          thumbGroupShiftX,
+          -(THUMB_SIZE + THUMB_GAP),
+          { duration: 0.4, ease: "easeOut" }
+        );
+      }
 
       // ===== 删除发生在活跃行内 → 驱动"右侧整段共享平移"（源码级改造） =====
       // 不调用 swiper.slideToLoop 去"切到下一张"（那会带动整条 wrapper、连左侧卡一起移）。而是把
       // "被删图右侧所有图左移一格"表达为**一个共享 motion 值** groupShiftX 从 0 → -一格槽距：
       // 右侧每张卡在同一渲染里读取该值 → 视觉上即一次 wrapper 平移级别的平滑整段移动（同一动画源零失步）。
       // 被删图左侧的卡不读取 → 原地不动。与切换同速（0.4s easeOut）、同位移（一整格槽距）。
-      if (index >= wasReal && index < wasReal + viewMode) {
+      if (index >= wasReal && index < wasReal + viewMode && !devDisableSurvivorAnim) {
         const gGap = viewMode > 1 ? 8 : 0;
         const gSlotW = containerWidth > 0 ? (containerWidth - (viewMode - 1) * gGap) / viewMode : containerWidth;
         const gShift = containerWidth > 0 ? gSlotW + gGap : 0;
@@ -1074,10 +1091,11 @@ function SwiperLoopCarousel({
           }
         }
         const incoming = images[wasReal + viewMode];
-        // 双图/三图：incoming 在删除窗口内是 rider、已播 deleteEntryTarget 入场，重排后须静置抑制二次入场。
-        // 单图（viewMode===1）：incoming 在活跃窗口外未被渲染、从未播入场；重排后它变唯一活跃中心，
-        // 不能被抑制（否则新入图完全没有入场动画）。故仅 viewMode>1 时把 incoming 纳入静置抑制。
-        if (incoming && !removedIdsRef.current.has(incoming.id) && viewMode > 1) {
+        // incoming（realIndex+viewMode）在删除窗口内是 rider、已播 deleteEntryTarget 入场（单图/双图/三图
+        // 一致：incoming 在下标 [realIndex, realIndex+viewMode) 之外但仍在 nearActiveSet 渲染、且被
+        // neighborHidden 豁免，故删除窗口内已同时机入场）。重排后一律纳入静置抑制，杜绝"补位后又按
+        // 切换速度再入一次场"造成的不同时机/不同速度。故不再用 viewMode>1 区分。
+        if (incoming && !removedIdsRef.current.has(incoming.id)) {
           relocateFillIdsRef.current.set(incoming.id, 0);
         }
       }
@@ -1295,7 +1313,7 @@ function SwiperLoopCarousel({
         }, DELETE_SERIAL_BUFFER_MS);
       }, 460);
     },
-    [deletingId, getOrCreateImageMotions, images, n, viewMode, hasMore, preloader, pruneDeleteFillState, containerWidth, containerHeight]
+    [deletingId, getOrCreateImageMotions, images, n, viewMode, hasMore, preloader, pruneDeleteFillState, containerWidth, containerHeight, devDisableDeleteAnim, devDisableSurvivorAnim]
   );
   // 队列接力触发的后续删除必须命中"最新"的实现（重排后 images/deletingId 均更新）
   flyOutAndRemoveRef.current = flyOutAndRemove;
@@ -3022,7 +3040,8 @@ function SwiperLoopCarousel({
       // overflow 全 visible（横/纵都能溢出透出），横向是否被裁完全交给上面的 clip-path
       overflow: "visible",
       ...(horizontalClip ? { clipPath: horizontalClip, WebkitClipPath: horizontalClip } : {}),
-      ...(neighborHidden ? { visibility: "hidden" } : {}),
+      // neighborHidden（过渡期隐藏无关邻图）或 Dev"隐藏主图"（visibility 保留布局，仅不可见）
+      ...(neighborHidden || devHideMainImage ? { visibility: "hidden" } : {}),
     };
     // 该滑片内容（图片+motion）与滑片外壳(overflow 裁剪)拆分：
     // - 非虚拟(小 n)：外壳 = SwiperSlide，内容放其内部
@@ -3101,6 +3120,7 @@ function SwiperLoopCarousel({
               deleteEntryTarget={deleteEntryTarget}
               deleteTranslateX={deleteTranslateX}
               groupShiftX={rider ? groupShiftX : undefined}
+              groupShiftScaleX={rider ? motionsNow.scale : undefined}
               viewModeOffsetX={viewModeOffsetX}
               entryXFrom={entryXFrom}
               entryScaleFrom={entryScaleFrom}
@@ -3205,7 +3225,7 @@ function SwiperLoopCarousel({
         </div>
     );
     return { node, slideClassName, overflowClip };
-  }, [images, realIndex, n, prevViewMode, viewMode, isTransitioningViewMode, isSwipeAnimating, containerWidth, containerHeight, preloader, preloader.version, isPinching, activeIndices, wasActiveMap, viewModeEpoch, slideDirectionRef, getOrCreateImageMotions, renderOverlay, onDownload, imgDraggingIdx, imgOverflowActive, actionsConfig, flyOutAndRemove, startRename, deletingId, renamedMapRef, renameSeq, deletingReshapedRef, onThumbLoaded]);
+  }, [images, realIndex, n, prevViewMode, viewMode, isTransitioningViewMode, isSwipeAnimating, containerWidth, containerHeight, preloader, preloader.version, isPinching, activeIndices, wasActiveMap, viewModeEpoch, slideDirectionRef, getOrCreateImageMotions, renderOverlay, onDownload, imgDraggingIdx, imgOverflowActive, actionsConfig, flyOutAndRemove, startRename, deletingId, renamedMapRef, renameSeq, deletingReshapedRef, onThumbLoaded, devHideMainImage]);
 
   // 非虚拟(<n)：内容包回 SwiperSlide，行为与原来完全一致
   const renderSlideContent = useCallback((index: number) => {
@@ -3508,6 +3528,64 @@ function SwiperLoopCarousel({
             />
           </div>
 
+          {/* Dev 调试控制面板：仅非生产构建渲染，生产构建整段被 DCE 排除，零运行时开销 */}
+          {isDev && (
+            <div
+              className="absolute right-3 top-3 z-[60] select-none"
+              onClick={(e) => e.stopPropagation()}
+              style={{ fontFamily: "ui-monospace, SFMono-Regular, monospace" }}
+            >
+              <button
+                onClick={() => setDevPanelOpen((o) => !o)}
+                className="pointer-events-auto flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold transition-transform hover:scale-105 active:scale-95"
+                style={{
+                  backgroundColor: "rgba(0,0,0,0.55)",
+                  color: "#fff",
+                  border: "1px solid rgba(255,255,255,0.25)",
+                  backdropFilter: "blur(6px)",
+                }}
+              >
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+                Dev
+              </button>
+              {devPanelOpen && (
+                <div
+                  className="mt-1.5 flex w-56 flex-col gap-2 rounded-xl p-3 text-xs"
+                  style={{
+                    backgroundColor: "rgba(0,0,0,0.7)",
+                    color: "#fff",
+                    border: "1px solid rgba(255,255,255,0.2)",
+                    backdropFilter: "blur(8px)",
+                  }}
+                >
+                  <div className="mb-0.5 text-[11px] font-bold uppercase tracking-wider opacity-70">调试开关</div>
+                  {[
+                    { key: "devHideThumbs", label: "隐藏底部缩略图条", value: devHideThumbs, set: setDevHideThumbs },
+                    { key: "devDisableDeleteAnim", label: "关闭被删除图片动画", value: devDisableDeleteAnim, set: setDevDisableDeleteAnim },
+                    { key: "devDisableSurvivorAnim", label: "关闭幸存图补位动画", value: devDisableSurvivorAnim, set: setDevDisableSurvivorAnim },
+                    { key: "devHideMainImage", label: "隐藏主图", value: devHideMainImage, set: setDevHideMainImage },
+                  ].map(({ key, label, value, set }) => (
+                    <label
+                      key={key}
+                      className="flex cursor-pointer items-center justify-between gap-2 rounded-lg px-2 py-1.5"
+                      style={{ backgroundColor: "rgba(255,255,255,0.06)" }}
+                    >
+                      <span className="leading-snug">{label}</span>
+                      <input
+                        type="checkbox"
+                        checked={value}
+                        onChange={(e) => set(e.target.checked)}
+                        className="pointer-events-auto h-3.5 w-3.5 cursor-pointer accent-blue-400"
+                      />
+                    </label>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
           {extraOverlayContent && isOpen && extraOverlayContent({ image: images[realIndex], index: realIndex, total: totalCount, isActive: true })}
 
           {/* 图片功能：重命名输入面板（与名称栏同域，默认样式，可通过 renameInputClassName 覆盖） */}
@@ -3568,7 +3646,7 @@ function SwiperLoopCarousel({
             );
           })()}
 
-          <div className="flex justify-center w-full" onClick={(e) => e.stopPropagation()}>
+          <div className={`flex justify-center w-full ${devHideThumbs ? "hidden" : ""}`} onClick={(e) => e.stopPropagation()}>
             <motion.div
               ref={stripWheelRef}
               className={`relative z-[60] mt-[17px] shrink-0 overflow-hidden ${isStripDragging && dragMoved ? "cursor-grabbing" : "cursor-grab"}`}

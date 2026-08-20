@@ -36,6 +36,12 @@ interface AnimatedSlideImgProps {
    *  左侧图不绑定（不传 / undefined）→ 原地不动。动画只对这一个共享值发生，多卡由同一动画源
    *  驱动、零逐卡失步，观感等同"下一张"wrapper 平移。 */
   groupShiftX?: import("motion/react").MotionValue<number>;
+  /** 本卡的缩放/拖拽外层变换 scale motion 值（等效 motionsNow.scale）。
+   *  组内共享 groupShiftX 是被"right 幸存图整段"共用的屏幕位移（一格），而它施加在本卡内层
+   *  （被外层 scale 缩放的坐标系里），视觉位移会被乘以外层 scale。缩放≠1（被缩放/拖拽）的幸存图
+   *  删除补位时平移更快/更远，与左侧未缩放图失步。传入本卡的 scale 后，共享位移改为
+   *  groupShiftX ÷ scale，使屏幕位移恒定为一格、与缩放无关（未缩放卡 scale=1 不受影响）。 */
+  groupShiftScaleX?: import("motion/react").MotionValue<number>;
   viewModeOffsetX?: number;
   entryXFrom?: number;
   entryScaleFrom?: number;
@@ -84,6 +90,7 @@ export default function AnimatedSlideImg({
   deleteEntryTarget = false,
   deleteTranslateX,
   groupShiftX,
+  groupShiftScaleX,
   viewModeOffsetX = 0,
   entryXFrom,
   entryScaleFrom,
@@ -107,7 +114,14 @@ export default function AnimatedSlideImg({
   const entryX = entryXProp ?? internalEntryX;
   // 源码级共享平移合成：删除动画只发生在共享 groupShiftX 这一个 motion 值上（右侧整段一次平滑左移一格），
   // 这里把它与自身 entryX 叠加为最终水平位移。左侧卡不传 groupShiftX → combinedX 恒等于 entryX，行为不变。
-  const combinedX = useTransform(() => entryX.get() + (groupShiftX?.get() ?? 0));
+  const combinedX = useTransform(() => {
+    const shift = groupShiftX?.get() ?? 0;
+    // 共享删除补位位移在本卡内层（被外层 scale 缩放），为保持屏幕位移恒定为一格，
+    // 用本卡外层 scale 反推：shift ÷ scale。scale≤0 时退化原值（异常保护）。
+    const sc = groupShiftScaleX?.get() ?? 1;
+    const scale = sc > 0.05 ? sc : 1;
+    return entryX.get() + shift / scale;
+  });
   // wasActiveProp 由父组件持久化，即使组件因 Swiper loopFix DOM 移动被重新挂载，
   // 也能获得正确的"上一次 isActive"值，避免动画丢失
   const wasActiveRef = useRef(wasActiveProp ?? isActive);
