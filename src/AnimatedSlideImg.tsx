@@ -325,9 +325,17 @@ export default function AnimatedSlideImg({
   }, [cleanupAllAnims, entryScale, entryOpacity, entryX, slideDirectionRef]);
 
   // 补偿动画
+  // 注意：只在 viewModeEpoch 变化时跑一次，**不**因 entryScaleFrom/entryXFrom 变化重跑。
+  // 视图切换动画期间（isTransitioningViewMode）若原图加载完成，父级用缩略图尺寸锁定 entryScaleFrom
+  // 不变化；但动画结束后（isTransitioningViewMode=false）dims 会从缩略图切回原图、entryScaleFrom
+  // 随之变化——若依赖它就会把同一段补偿动画重放第二遍（"加载中的图播放两遍切换动画"）。
+  // 用已处理的 viewModeEpoch 守卫：同一次视图切换（同一 epoch）的补偿动画只启动一次。
+  const compensationEpochRef = useRef(-1);
   useEffect(() => {
     lastViewModeEpochRef.current = viewModeEpoch;
     if (entryScaleFrom != null && entryXFrom != null) {
+      if (compensationEpochRef.current === viewModeEpoch) return;
+      compensationEpochRef.current = viewModeEpoch;
       isFirstRenderRef.current = false;
       isCompensatingRef.current = true;
       wasActiveBeforeCompensationRef.current = wasActiveRef.current;

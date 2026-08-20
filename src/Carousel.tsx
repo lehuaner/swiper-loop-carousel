@@ -886,18 +886,19 @@ function SwiperLoopCarousel({
       }
       isViewModeChangingRef.current = true;
       setIsTransitioningViewMode(true);
-      // 视图切换动画期间把每一张参与过渡的图的"缩放/拖拽"重置到当前模式的默认尺寸（scale→1、x/y→0）：
-      // 否则被放大图在切换后保留放大倍率（且与 entryScaleFrom 补偿叠加成"瞬间二次放大并左移"）。
-      // 遍历当前可见范围（old 行 + 将进入的下一张），各自 animate 到默认值，与 0.4s 过渡同步。
-      const rzBase = realIndexRef.current;
-      const rzMax = Math.max(viewMode, mode);
-      for (let k = 0; k < rzMax + 1; k++) {
-        const m = imageMotionsMapRef.current.get(rzBase + k);
+      // 视图切换：若只"animate 外层缩放/拖拽到默认"，再叠加 entryScaleFrom/entryXFrom 补偿，
+      // 两层会叠加成"起始位置/大小偏离当前缩放与拖拽值"。改为：先把当前外层缩放/拖拽快照下来，
+      // 并立即把外层置为身份变换；随后 AnimatedSlideImg 用快照折算的 entryScaleFrom/entryXFrom
+      // 从"当前缩放+拖拽"出发连续过渡到新模式的默认尺寸（见 renderSlideInner）。
+      const snapBase = realIndexRef.current;
+      const snapMax = Math.max(viewMode, mode);
+      for (let k = 0; k < snapMax + 1; k++) {
+        const m = imageMotionsMapRef.current.get(snapBase + k);
         if (!m) continue;
-        const eps = { duration: 0.4, ease: [0.25, 0.1, 0.25, 1] as const };
-        animate(m.scale, 1, eps);
-        animate(m.x, 0, eps);
-        animate(m.y, 0, eps);
+        viewSwitchFromRef.current.set(snapBase + k, { scale: m.scale.get(), x: m.x.get(), y: m.y.get() });
+        m.scale.set(1);
+        m.x.set(0);
+        m.y.set(0);
       }
       setViewMode(mode);
       setViewModeEpoch((e) => e + 1);
@@ -915,6 +916,12 @@ function SwiperLoopCarousel({
   // 每张图片独立的 motionX/Y/Scale（按 images 数组下标存储，切换时不会互相影响）
   // 懒加载：只在 slide 实际渲染时创建 MotionValue，避免 2000 张图一次性创建 6000 个对象
   const imageMotionsMapRef = useRef<Map<number, ImageMotions>>(new Map());
+  // 视图切换前各可见卡"外层缩放/拖拽"快照（index -> {scale,x,y}）。
+  // 外层变换（motionsNow.scale/x/y）与被放大图冲突：切换若一边 animate 外层到默认、一边用
+  // entryScaleFrom/entryXFrom 补偿，两层会叠加成"起始位置/大小偏离当前缩放与拖拽值"。改为切换瞬间
+  // 把外层置为身份变换，并把当前缩放/拖拽折算进内层 entryScaleFrom/entryXFrom 的起始值，使动画
+  // 严格从"当前缩放+拖拽"出发、连续过渡到新模式的默认尺寸。
+  const viewSwitchFromRef = useRef<Map<number, { scale: number; x: number; y: number }>>(new Map());
   const getOrCreateImageMotions = useCallback((index: number): ImageMotions => {
     let m = imageMotionsMapRef.current.get(index);
     if (!m) {
@@ -1106,13 +1113,12 @@ function SwiperLoopCarousel({
             relocateSurvivorFillIdsRef.current.set(sib.id, 0);
           }
         }
-        const incoming = images[wasReal + viewMode];
-        // 双图/三图：incoming 在删除窗口内是 rider、已播 deleteEntryTarget 入场，重排后须静置抑制二次入场。
-        // 单图（viewMode===1）：incoming 在活跃窗口外未被渲染、从未播入场；重排后它变唯一活跃中心，
-        // 不能被抑制（否则新入图完全没有入场动画）。故仅 viewMode>1 时把 incoming 纳入静置抑制。
-        if (incoming && !removedIdsRef.current.has(incoming.id) && viewMode > 1) {
-          relocateFillIdsRef.current.set(incoming.id, 0);
-        }
+        // incoming（realIndex+viewMode，单图/双图/三图一致）：删除窗口内是 rider + deleteEntryTarget，
+        // 已播"与切换 next 同源"的入场。**不能**在此把 incoming 塞进 relocateFillIds（占位 0 会让它在
+        // 删除窗口内首次挂载时就因 deleteFillTarget=true 被静置，deleteEntryTarget 入场被整段跳过
+        // —— 这正是单图删除新入图动画"完全消失"的根因）。incoming 的"重排后静置抑制二次入场"
+        // 改到重排提交时（见 460ms setTimeout 内）才设置，此刻 deleteEntryTarget 早已播完。
+        // 右幸存图仍在此占位（它们在窗口内做纯左移补位、无 deleteEntryTarget 入场，可立即静置）。
       }
       // 复用切换的图片加载管线：删除窗口内"从右侧进入的新图"（realIndex+viewMode）不在
       // requestActive 的 visible 集内，需等重排后 realIndex 更新才被加载；这里立即 requestLoad，
@@ -1202,6 +1208,15 @@ function SwiperLoopCarousel({
         }
         for (const id of relocateSurvivorFillIdsRef.current.keys()) {
           relocateSurvivorFillIdsRef.current.set(id, settleNow);
+        }
+        // incoming（单图/双图/三图一致）的"重排后静置抑制二次入场"在此刻才生效：
+        // 删除窗口内它是 rider+deleteEntryTarget，正在播与切换同源的入场，不能静置；
+        // 重排提交后它已落位，加入静置集合（此刻刷新为 settleNow），杜绝"落位后 isActive 闪断
+        // 再播一遍入场"（播放两遍切换动画）。它在删除窗口开始时未进集合（见上方注释），
+        // 这里按"进入新末位的那张图"（原 wasReal+viewMode → 重排后变 wasReal）补进。
+        const reflowIncoming = images[wasReal + viewMode];
+        if (reflowIncoming && !removedIdsRef.current.has(reflowIncoming.id)) {
+          relocateFillIdsRef.current.set(reflowIncoming.id, settleNow);
         }
         // ===== 共享平移：结束动画，但【不立即归零】 =====
         // 右侧整段 groupShiftX 使它们比原始槽位左移一格。此刻若立即 set(0)，会在"被删图移除
@@ -2069,6 +2084,8 @@ function SwiperLoopCarousel({
       setIsTransitioningViewMode(false);
       prevViewModeRef.current = viewMode;
       setPrevViewMode(viewMode);
+      // 过渡结束：清除本次切换前的外层缩放/拖拽快照，避免残留影响下一次渲染
+      viewSwitchFromRef.current.clear();
     }, 450);
 
     return () => window.clearTimeout(t);
@@ -2906,14 +2923,31 @@ function SwiperLoopCarousel({
 
       // 缩放补偿优先用"原图"自然尺寸；原图未就绪时用"缩略图"自然尺寸（当前实际显示内容），
       // 使过渡初始大小与切换按下前一致，避免退化为 newVM/prevVM 在宽高比不符时"中心图突然放大"。
-      const dims = preloader.getDims(index) ?? thumbDimsRef.current.get(img.id);
+      // 注意：动画期间（isTransitioningViewMode）必须**固定用缩略图尺寸**（此时 displaySrc 正是缩略图，
+      // 实际显示内容一致），且不能因原图在动画中加载完成而改用原图尺寸——否则 entryScaleFrom 中途
+      // 变化会让补偿动画 effect（依赖 entryScaleFrom）重跑第二遍 → "原图加载中切视图，图播放两遍动画"。
+      const dims =
+        isTransitioningViewMode
+          ? thumbDimsRef.current.get(img.id)
+          : preloader.getDims(index) ?? thumbDimsRef.current.get(img.id);
+      let baseScaleFrom: number;
       if (dims && containerHeight > 0) {
         const oldSize = computeContainedSize(dims.w, dims.h, getSlideW(prevVM), containerHeight);
         const newSize = computeContainedSize(dims.w, dims.h, getSlideW(newVM), containerHeight);
-        entryScaleFrom = oldSize.w / newSize.w;
+        baseScaleFrom = oldSize.w / newSize.w;
       } else {
-        entryScaleFrom = newVM / prevVM;
+        baseScaleFrom = newVM / prevVM;
       }
+      // 折叠切换前的"外层缩放/拖拽"到补偿起点（指令集在 changeViewMode 已把外层置为身份变换）：
+      //   - 缩放：起点倍数再乘当前 scale，使动画从"当前缩放大小"连续放大/缩小到新模式默认；
+      //   - 平移：当前 x/y 叠加进 entryXFrom/entryYFrom，使起点位置 = 当前拖拽位置。
+      // 无快照（非 changeViewMode 触发的降级/自动切换）时退化为不折叠，行为与原一致。
+      const snap = viewSwitchFromRef.current.get(index);
+      if (snap) {
+        baseScaleFrom *= snap.scale;
+        entryXFrom += snap.x;
+      }
+      entryScaleFrom = baseScaleFrom;
 
       if (relIdx < prevVM && relIdx >= newVM) {
         isExitingOnViewModeChange = true;
@@ -3029,17 +3063,23 @@ function SwiperLoopCarousel({
     // 判定（右幸存图左移一格 → relIdx-1，与切换 next 落位一致）：随盒平移中始终裁剪到目标槽位，
     // 放大图多余的横向溢出不会越过中线漏到相邻卡。
     let movingClipPath: string | undefined;
-    if (rider && viewMode > 1 && !devDisableSurvivorAnim) {
-      const landRel = relIdx - 1; // 右幸存图左移一格后落位
-      const landInRow = landRel < viewMode;
-      const landFirst = landRel === 0;
-      const landLast = landRel === viewMode - 1;
-      const landClipLeft = landInRow ? !landFirst : true;
-      const landClipRight = landInRow ? !landLast : true;
-      if (landClipLeft || landClipRight) {
-        const L = landClipLeft ? "0" : "-9999px";
-        const R = landClipRight ? "0" : "-9999px";
-        movingClipPath = `inset(-9999px ${R} -9999px ${L})`;
+    if (rider && !devDisableSurvivorAnim) {
+      if (viewMode > 1) {
+        const landRel = relIdx - 1; // 右幸存图左移一格后落位
+        const landInRow = landRel < viewMode;
+        const landFirst = landRel === 0;
+        const landLast = landRel === viewMode - 1;
+        const landClipLeft = landInRow ? !landFirst : true;
+        const landClipRight = landInRow ? !landLast : true;
+        if (landClipLeft || landClipRight) {
+          const L = landClipLeft ? "0" : "-9999px";
+          const R = landClipRight ? "0" : "-9999px";
+          movingClipPath = `inset(-9999px ${R} -9999px ${L})`;
+        }
+      } else {
+        // 单图模式：进入/补位的 rider 左移一整格，被放大图会让像素越过自身（容器）边界泄出到画布/暗边，
+        // 与别图重叠。随盒裁切到自身盒子两侧（左右都裁、上下不裁）：平移中始终裁剪到容器范围。
+        movingClipPath = "inset(-9999px 0 -9999px 0)";
       }
     }
     // 溢出透图时隐藏非活跃相邻图：窄屏下 canvas 宽度小，相邻滑片会有一部分落到屏幕边缘，
@@ -3082,7 +3122,11 @@ function SwiperLoopCarousel({
     // 该滑片内容（图片+motion）与滑片外壳(overflow 裁剪)拆分：
     // - 非虚拟(小 n)：外壳 = SwiperSlide，内容放其内部
     // - 虚拟(大 n)：内容放入独立分层(absolute)，盖在 Swiper 空占位滑片上，避免每次切图重渲染全量 children
-    const overflowClip = viewMode === 1 && !isTransitioningViewMode && !imgOverflowing;
+    // 单图模式下的 overflow 裁剪：仅当图片未溢出（未被缩放/拖拽）时裁剪。
+    // 用订阅式 imgOverflowActive（真实监听 scale/x/y 变化并触发重渲染）而非渲染期读
+    // motionsNow.scale.get()（滚轮缩放只改 motion 值不触发重渲染，会停留在旧值 → 必须拖一次才透图）。
+    // 单图模式下可见滑片即 realIndex，imgOverflowActive 恰反映它，故可直接使用。
+    const overflowClip = viewMode === 1 && !isTransitioningViewMode && !imgOverflowActive;
     const slideClassName = `!flex h-full min-h-0 items-center justify-center${overflowClip ? " !overflow-hidden" : ""}`;
     const node: React.ReactElement = (
         <div
@@ -3568,7 +3612,7 @@ function SwiperLoopCarousel({
           {/* Dev 调试控制面板：仅非生产构建渲染，生产构建整段被 DCE 排除，零运行时开销 */}
           {isDev && (
             <div
-              className="absolute bottom-24 right-3 z-[60] select-none"
+              className="absolute top-16 right-16 z-[60] select-none"
               onClick={(e) => e.stopPropagation()}
               style={{ fontFamily: "ui-monospace, SFMono-Regular, monospace" }}
             >
