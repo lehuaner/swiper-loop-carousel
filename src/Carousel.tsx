@@ -995,19 +995,25 @@ function SwiperLoopCarousel({
       }
 
       // 目标 = 删除按钮中心（运行时获取，不写死像素）；卡片尺寸 = 删除前图片的真实可见矩形。
-      if (effTarget && effImgEl && effImgEl.isConnected) {
-        playSuction({ imgEl: effImgEl, target: effTarget, durationMs: 1400 / 3.5 });
-        m.opacity.set(0); // 隐藏原 DOM 图，交由 canvas 覆盖层呈现吸入过程
-      } else {
-        // 兜底：拿不到图片/目标时，退回原"向右上角收缩淡出"动画
-        const suckX = Math.max(120, containerWidth * 0.38);
-        const suckY = Math.max(80, containerHeight * 0.38);
-        animate(m.scale, 0.02, { duration: 0.4, ease: [0.55, 0, 1, 0.45] });
-        animate(m.x, suckX, { duration: 0.4, ease: [0.55, 0, 1, 0.45] });
-        animate(m.y, -suckY, { duration: 0.4, ease: [0.55, 0, 1, 0.45] });
-        animate(m.opacity, 0, { duration: 0.4, ease: "easeIn" });
-        animate(m.rotate, 14, { duration: 0.4, ease: [0.55, 0, 1, 0.45] });
-      }
+      // 方案B错峰：playSuction 的同步初始化（2MB 纹理 drawImage、canvas append 触发 layout、网格
+      // 顶点构建）在删除点击同一帧执行会阻塞主线程 → 吸入动画**启动首帧**掉帧（trace 点击时刻主线程忙）。
+      // 把"启动吸入 + 隐藏 DOM 图"整体后移到下一帧 rAF，先响应点击并送出右侧平移动画，再开始吸入。
+      const startSuction = () => {
+        if (effTarget && effImgEl && effImgEl.isConnected) {
+          playSuction({ imgEl: effImgEl, target: effTarget, durationMs: 1400 / 3.5 });
+          m.opacity.set(0); // 隐藏原 DOM 图，交由 canvas 覆盖层呈现吸入过程
+        } else {
+          // 兜底：拿不到图片/目标时，退回原"向右上角收缩淡出"动画
+          const suckX = Math.max(120, containerWidth * 0.38);
+          const suckY = Math.max(80, containerHeight * 0.38);
+          animate(m.scale, 0.02, { duration: 0.4, ease: [0.55, 0, 1, 0.45] });
+          animate(m.x, suckX, { duration: 0.4, ease: [0.55, 0, 1, 0.45] });
+          animate(m.y, -suckY, { duration: 0.4, ease: [0.55, 0, 1, 0.45] });
+          animate(m.opacity, 0, { duration: 0.4, ease: "easeIn" });
+          animate(m.rotate, 14, { duration: 0.4, ease: [0.55, 0, 1, 0.45] });
+        }
+      };
+      requestAnimationFrame(startSuction);
 
       // ===== 缩略图条：被删缩略图右侧整段同帧左移一格（与飞出/主图右侧段同步） =====
       // 不论删除发生在哪（活跃行内/外），缩略图条中被删图右侧的缩略图都要左移一格合并。
