@@ -21,6 +21,10 @@ export interface SuctionOptions {
   gridCols?: number;
   /** 动画时长 ms */
   durationMs?: number;
+  /** （可选）卡片"框定区域"（视口坐标）。被删图若已被缩放/拖拽到超出滑片边界，
+   *  其 getBoundingClientRect 会超出实际可见区；传入可见区后，形变卡片被 clamp 到其内，
+   *  删除动画不再突破拖拽框定的边界。 */
+  crop?: { x: number; y: number; w: number; h: number };
   /** 完成回调（用于衔接删除提交流程） */
   onDone?: () => void;
 }
@@ -36,7 +40,7 @@ function easeInOut(t: number): number {
 }
 
 export function playSuction(opts: SuctionOptions): void {
-  const { imgEl, target, gridCols = 18, durationMs = 1400, onDone } = opts;
+  const { imgEl, target, gridCols = 18, durationMs = 1400, crop, onDone } = opts;
   const cols = Math.max(3, Math.min(MAX_GRID, Math.round(gridCols)));
   const targetCenter = { x: target.x, y: target.y };
 
@@ -64,6 +68,22 @@ export function playSuction(opts: SuctionOptions): void {
   if (cardW < 1 || cardH < 1) {
     onDone?.();
     return;
+  }
+  // 卡片 clamp 到"框定区域"（crop）：被删图被缩放/拖拽到超边界时，形变卡片限制在可见区内，
+  // 删除动画不突破拖拽边界。目标点若在 crop 外（按钮在边界外），也 clamp 到 crop 内，
+  // 避免吸入口顶点目标越界。
+  if (crop) {
+    const cx0 = crop.x, cy0 = crop.y, cx1 = crop.x + crop.w, cy1 = crop.y + crop.h;
+    const ic0x = Math.max(cardX, cx0), ic0y = Math.max(cardY, cy0);
+    const ic1x = Math.min(cardX + cardW, cx1), ic1y = Math.min(cardY + cardH, cy1);
+    if (ic1x - ic0x < 1 || ic1y - ic0y < 1) {
+      // 被删图完全在可见区外：无可见内容可形变，直接结束（走后续删除流程）
+      onDone?.();
+      return;
+    }
+    cardX = ic0x; cardY = ic0y; cardW = ic1x - ic0x; cardH = ic1y - ic0y;
+    targetCenter.x = Math.max(cx0, Math.min(cx1, targetCenter.x));
+    targetCenter.y = Math.max(cy0, Math.min(cy1, targetCenter.y));
   }
 
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -160,6 +180,37 @@ export function playSuction(opts: SuctionOptions): void {
     card.origVertices.push(or);
   }
 
+  // ===== 方案A：三角常量预计算（源矩形外扩1px + 仿射矩阵分母）=====
+  // 每单元格两个三角形：源三角形坐标、裁剪源矩形、分母都是常量，初始化时一次性算好；
+  // 每帧 drawCardMesh 只依据当前变形后的目标顶点计算仿射矩阵并绘制，显著降低主线程每帧成本。
+  const TRI_PAD = 1.5; // 目标外扩防接缝（与旧 drawTexTri 内部 PAD 一致）
+  interface TriConst {
+    sx0: number; sy0: number; sx1: number; sy1: number; sx2: number; sy2: number;
+    ssx: number; ssy: number; ssw: number; ssh: number; denom: number;
+  }
+  const triCache: TriConst[][] = [];
+  for (let r = 0; r < rows; r++) {
+    const rowTri: TriConst[] = [];
+    for (let c = 0; c < cols; c++) {
+      const s0x = (c / cols) * tw, s0y = (r / rows) * th;
+      const s1x = ((c + 1) / cols) * tw, s1y = s0y;
+      const s2x = s1x, s2y = ((r + 1) / rows) * th;
+      const s3x = s0x, s3y = s2y;
+      const minx = Math.max(0, Math.min(s0x, s1x, s2x, s3x) - 1);
+      const miny = Math.max(0, Math.min(s0y, s1y, s2y, s3y) - 1);
+      const maxx = Math.min(tw, Math.max(s0x, s1x, s2x, s3x) + 1);
+      const maxy = Math.min(th, Math.max(s0y, s1y, s2y, s3y) + 1);
+      const mk = (ax: number, ay: number, bx: number, by: number, cx2: number, cy: number): TriConst => ({
+        sx0: ax, sy0: ay, sx1: bx, sy1: by, sx2: cx2, sy2: cy,
+        ssx: minx, ssy: miny, ssw: maxx - minx, ssh: maxy - miny,
+        denom: (bx - ax) * (cy - ay) - (by - ay) * (cx2 - ax) || 1e-6,
+      });
+      rowTri.push(mk(s0x, s0y, s1x, s1y, s2x, s2y));
+      rowTri.push(mk(s0x, s0y, s2x, s2y, s3x, s3y));
+    }
+    triCache.push(rowTri);
+  }
+
   // 选离目标（删除按钮中心）最近的角为"起始吸入角"，并缓存每顶点前沿距离
   const pickStartCorner = () => {
     const corners: [number, number][] = [
@@ -218,49 +269,38 @@ export function playSuction(opts: SuctionOptions): void {
     }
   };
 
-  // 三角纹理映射：用仿射矩阵把纹理三角形贴合到目标三角形，PAD 外扩防接缝
-  const drawTexTri = (
-    sx0: number, sy0: number, sx1: number, sy1: number, sx2: number, sy2: number,
-    dx0: number, dy0: number, dx1: number, dy1: number, dx2: number, dy2: number,
+  // 三角纹理映射（方案A）：用预计算常量 + 每帧目标顶点算仿射矩阵。
+  // 目标三角形做 TRI_PAD 外扩防接缝（把纹理映射到外扩后的目标，等效旧"裁剪到外扩三角形"）。
+  // 不再每三角 save/clip/restore（每帧最多 ~2·cols·rows 次状态入栈/裁剪），改用
+  // setTransform(基变换) + transform(仿射) 直接绘制——显著降低主线程每帧成本。
+  const drawTexTriFast = (
+    t: TriConst,
+    d0: { x: number; y: number },
+    d1: { x: number; y: number },
+    d2: { x: number; y: number },
   ) => {
-    const denom = (sx1 - sx0) * (sy2 - sy0) - (sy1 - sy0) * (sx2 - sx0) || 1e-6;
-    const m11 = ((dx1 - dx0) * (sy2 - sy0) - (dx2 - dx0) * (sy1 - sy0)) / denom;
-    const m12 = ((dx2 - dx0) * (sx1 - sx0) - (dx1 - dx0) * (sx2 - sx0)) / denom;
-    const m21 = ((dy1 - dy0) * (sy2 - sy0) - (dy2 - dy0) * (sy1 - sy0)) / denom;
-    const m22 = ((dy2 - dy0) * (sx1 - sx0) - (dy1 - dy0) * (sx2 - sx0)) / denom;
-    const mtx = dx0 - (m11 * sx0 + m12 * sy0);
-    const mty = dy0 - (m21 * sx0 + m22 * sy0);
-
-    const PAD = 1.5;
-    const cx = (dx0 + dx1 + dx2) / 3;
-    const cy = (dy0 + dy1 + dy2) / 3;
-    const expand = (vx: number, vy: number) => {
+    const { sx0, sy0, sx1, sy1, sx2, sy2, ssx, ssy, ssw, ssh, denom } = t;
+    const cx = (d0.x + d1.x + d2.x) / 3;
+    const cy = (d0.y + d1.y + d2.y) / 3;
+    const expand = (vx: number, vy: number): [number, number] => {
       const ex = vx - cx;
       const ey = vy - cy;
       const l = Math.hypot(ex, ey) || 1;
-      return [vx + (ex / l) * PAD, vy + (ey / l) * PAD];
+      return [vx + (ex / l) * TRI_PAD, vy + (ey / l) * TRI_PAD];
     };
-    const a = expand(dx0, dy0);
-    const b = expand(dx1, dy1);
-    const c = expand(dx2, dy2);
-
-    const ssx = Math.max(0, Math.min(sx0, sx1, sx2) - 1);
-    const ssy = Math.max(0, Math.min(sy0, sy1, sy2) - 1);
-    const ssw = Math.min(tw, Math.max(sx0, sx1, sx2) + 1) - ssx;
-    const ssh = Math.min(th, Math.max(sy0, sy1, sy2) + 1) - ssy;
-
-    ctx.save();
-    ctx.beginPath();
-    ctx.moveTo(a[0], a[1]);
-    ctx.lineTo(b[0], b[1]);
-    ctx.lineTo(c[0], c[1]);
-    ctx.closePath();
-    ctx.clip();
-    // 用 transform（累乘）而非 setTransform（替换）：保留外层 scale(dpr) 与 translate(-minX,-minY)，
-    // 使纹理三角形映射到"包围盒画布"内的正确设备坐标（同时修正 dpr>1 时原 setTransform 丢失缩放的隐患）
+    const a = expand(d0.x, d0.y);
+    const b = expand(d1.x, d1.y);
+    const c2 = expand(d2.x, d2.y);
+    const m11 = ((b[0] - a[0]) * (sy2 - sy0) - (c2[0] - a[0]) * (sy1 - sy0)) / denom;
+    const m12 = ((c2[0] - a[0]) * (sx1 - sx0) - (b[0] - a[0]) * (sx2 - sx0)) / denom;
+    const m21 = ((b[1] - a[1]) * (sy2 - sy0) - (c2[1] - a[1]) * (sy1 - sy0)) / denom;
+    const m22 = ((c2[1] - a[1]) * (sx1 - sx0) - (b[1] - a[1]) * (sx2 - sx0)) / denom;
+    const mtx = a[0] - (m11 * sx0 + m12 * sy0);
+    const mty = a[1] - (m21 * sx0 + m22 * sy0);
+    // 重置到基变换（dpr + 平移包围盒原点），再叠加仿射；clip 由外层 drawCardMesh 的卡片多边形统一负责
+    ctx.setTransform(dpr, 0, 0, dpr, -minX * dpr, -minY * dpr);
     ctx.transform(m11, m21, m12, m22, mtx, mty);
     ctx.drawImage(tex, ssx, ssy, ssw, ssh, ssx, ssy, ssw, ssh);
-    ctx.restore();
   };
 
   const drawCardMesh = (progress: number) => {
@@ -282,21 +322,16 @@ export function playSuction(opts: SuctionOptions): void {
     clipPath();
     ctx.clip();
     for (let r = 0; r < rows; r++) {
+      const triRow = triCache[r];
+      const vRow = vertices[r];
+      const vNext = vertices[r + 1];
       for (let c = 0; c < cols; c++) {
-        const d0 = vertices[r][c];
-        const d1 = vertices[r][c + 1];
-        const d2 = vertices[r + 1][c + 1];
-        const d3 = vertices[r + 1][c];
-        const s0x = (c / cols) * tw;
-        const s0y = (r / rows) * th;
-        const s1x = ((c + 1) / cols) * tw;
-        const s1y = s0y;
-        const s2x = s1x;
-        const s2y = ((r + 1) / rows) * th;
-        const s3x = s0x;
-        const s3y = s2y;
-        drawTexTri(s0x, s0y, s1x, s1y, s2x, s2y, d0.x, d0.y, d1.x, d1.y, d2.x, d2.y);
-        drawTexTri(s0x, s0y, s2x, s2y, s3x, s3y, d0.x, d0.y, d2.x, d2.y, d3.x, d3.y);
+        const d0 = vRow[c];
+        const d1 = vRow[c + 1];
+        const d2 = vNext[c + 1];
+        const d3 = vNext[c];
+        drawTexTriFast(triRow[c * 2], d0, d1, d2);
+        drawTexTriFast(triRow[c * 2 + 1], d0, d2, d3);
       }
     }
     ctx.restore();
@@ -312,6 +347,11 @@ export function playSuction(opts: SuctionOptions): void {
 
   // 吸入口：已移除螺旋漩涡、光晕与光锥，仅保留图片被吸入的形变
   const drawMouth = (_progress: number) => {};
+
+  // 首帧同步绘制，避免 rAF 延迟造成的 1 帧空档（被删图已隐藏，canvas 尚未就绪 → 白屏一瞬）
+  updateVertices(0);
+  drawCardMesh(0);
+  drawMouth(0);
 
   const start = performance.now();
   const loop = (now: number) => {

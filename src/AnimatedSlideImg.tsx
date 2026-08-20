@@ -517,7 +517,13 @@ export default function AnimatedSlideImg({
   // 原图已就绪（originalReady，如删除重排后重挂载的幸存图）时：直接显示原图、不渲染底层缩略图，
   // 避免新实例 imgLoaded 从头计数而在平移到位的一瞬露出缩略图。
   const isOriginal = Boolean(underlaySrc) && src !== underlaySrc;
-  const showUnderlay = isOriginal && !originalReady;
+  // 底层缩略图"常驻"（只要有缩略图、且非"原图已就绪"就渲染），而非仅 isOriginal 时才渲染。
+  // 否则 src 从缩略图切到原图那一瞬才首次新建底层 <img>，需重新加载/解码 → 中间露出空白帧
+  // （"到位后缩略图不见，再渐入一张缩略图"）。常驻后：
+  //   - src 还是缩略图阶段：主图(上层 z5) 即该缩略图、opacity1 盖住底层，无视觉差异，底层趁机已加载就绪；
+  //   - src 切到原图、主图 opacity 转 0：底层缩略图早已就绪无缝兜底 → 原图 onLoad 后淡入，无空白帧。
+  // 原图已就绪（originalReady，如重排后右幸存图）时不渲染底层，避免"重挂载后闪现缩略图"。
+  const showUnderlay = Boolean(underlaySrc) && !originalReady;
   const spinnerVisible = showSpinner ?? (isOriginal && !imgLoaded && !originalReady);
   return (
     <motion.div
