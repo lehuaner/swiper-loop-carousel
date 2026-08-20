@@ -278,6 +278,9 @@ const MemoAnimatedSlideImg = React.memo(
     prev.deleteFillSettledAt === next.deleteFillSettledAt &&
     prev.deleteEntryTarget === next.deleteEntryTarget &&
     prev.deleteTranslateX === next.deleteTranslateX &&
+    prev.groupShiftX === next.groupShiftX &&
+    prev.groupShiftScaleX === next.groupShiftScaleX &&
+    prev.movingClipPath === next.movingClipPath &&
     prev.viewModeOffsetX === next.viewModeOffsetX &&
     prev.entryXFrom === next.entryXFrom &&
     prev.entryScaleFrom === next.entryScaleFrom &&
@@ -883,6 +886,19 @@ function SwiperLoopCarousel({
       }
       isViewModeChangingRef.current = true;
       setIsTransitioningViewMode(true);
+      // 视图切换动画期间把每一张参与过渡的图的"缩放/拖拽"重置到当前模式的默认尺寸（scale→1、x/y→0）：
+      // 否则被放大图在切换后保留放大倍率（且与 entryScaleFrom 补偿叠加成"瞬间二次放大并左移"）。
+      // 遍历当前可见范围（old 行 + 将进入的下一张），各自 animate 到默认值，与 0.4s 过渡同步。
+      const rzBase = realIndexRef.current;
+      const rzMax = Math.max(viewMode, mode);
+      for (let k = 0; k < rzMax + 1; k++) {
+        const m = imageMotionsMapRef.current.get(rzBase + k);
+        if (!m) continue;
+        const eps = { duration: 0.4, ease: [0.25, 0.1, 0.25, 1] as const };
+        animate(m.scale, 1, eps);
+        animate(m.x, 0, eps);
+        animate(m.y, 0, eps);
+      }
       setViewMode(mode);
       setViewModeEpoch((e) => e + 1);
     },
@@ -1091,11 +1107,10 @@ function SwiperLoopCarousel({
           }
         }
         const incoming = images[wasReal + viewMode];
-        // incoming（realIndex+viewMode）在删除窗口内是 rider、已播 deleteEntryTarget 入场（单图/双图/三图
-        // 一致：incoming 在下标 [realIndex, realIndex+viewMode) 之外但仍在 nearActiveSet 渲染、且被
-        // neighborHidden 豁免，故删除窗口内已同时机入场）。重排后一律纳入静置抑制，杜绝"补位后又按
-        // 切换速度再入一次场"造成的不同时机/不同速度。故不再用 viewMode>1 区分。
-        if (incoming && !removedIdsRef.current.has(incoming.id)) {
+        // 双图/三图：incoming 在删除窗口内是 rider、已播 deleteEntryTarget 入场，重排后须静置抑制二次入场。
+        // 单图（viewMode===1）：incoming 在活跃窗口外未被渲染、从未播入场；重排后它变唯一活跃中心，
+        // 不能被抑制（否则新入图完全没有入场动画）。故仅 viewMode>1 时把 incoming 纳入静置抑制。
+        if (incoming && !removedIdsRef.current.has(incoming.id) && viewMode > 1) {
           relocateFillIdsRef.current.set(incoming.id, 0);
         }
       }
@@ -3009,6 +3024,24 @@ function SwiperLoopCarousel({
         horizontalClip = `inset(-9999px ${R} -9999px ${L})`;
       }
     }
+    // 外层盒子不裁（rider 时 horizontalClip 为 undefined），但被放大/拖拽图横移时会漏出到相邻槽位。
+    // 把"裁剪到目标槽位"改放到随 groupShiftX 平移的内层上（movingClipPath）。方向按"落位后的槽位"
+    // 判定（右幸存图左移一格 → relIdx-1，与切换 next 落位一致）：随盒平移中始终裁剪到目标槽位，
+    // 放大图多余的横向溢出不会越过中线漏到相邻卡。
+    let movingClipPath: string | undefined;
+    if (rider && viewMode > 1 && !devDisableSurvivorAnim) {
+      const landRel = relIdx - 1; // 右幸存图左移一格后落位
+      const landInRow = landRel < viewMode;
+      const landFirst = landRel === 0;
+      const landLast = landRel === viewMode - 1;
+      const landClipLeft = landInRow ? !landFirst : true;
+      const landClipRight = landInRow ? !landLast : true;
+      if (landClipLeft || landClipRight) {
+        const L = landClipLeft ? "0" : "-9999px";
+        const R = landClipRight ? "0" : "-9999px";
+        movingClipPath = `inset(-9999px ${R} -9999px ${L})`;
+      }
+    }
     // 溢出透图时隐藏非活跃相邻图：窄屏下 canvas 宽度小，相邻滑片会有一部分落到屏幕边缘，
     // 若不隐藏会从半透明"框架"区域直接看到左右两张邻图。
     // 例外一：正在被删除的图（删除飞出动画期间）即使已非活跃也保持可见，否则它的向上飞出效果会被隐藏。
@@ -3027,7 +3060,10 @@ function SwiperLoopCarousel({
       lastDeletedIndexRef.current !== index &&
       !deleteEntryTarget &&
       (
-        imgOverflowActive ||
+        // 缩放/拖拽溢出时隐藏非活跃邻图（防其从半透明框架漏出）。但在视图切换过渡中
+        // 必须放行"正在退出/进入"的邻图——否则被放大图的存在（imgOverflowActive=true）
+        // 会在过渡一开始就把第二张等邻图瞬间隐藏，导致它们"直接消失、无退出动画"。
+        (!isTransitioningViewMode && !isSwipeAnimating && imgOverflowActive) ||
         (!isTransitioningViewMode && !isSwipeAnimating) ||
         // 视图切换过渡中（单图→双图/三图、双图→三图等"变多"方向）：隐藏"新布局之外、与动画无关"
         // 的非活跃邻图，防止它们从半透明框架/屏幕边缘漏出（容器/Swiper 恒 overflow:visible）。
@@ -3121,6 +3157,7 @@ function SwiperLoopCarousel({
               deleteTranslateX={deleteTranslateX}
               groupShiftX={rider ? groupShiftX : undefined}
               groupShiftScaleX={rider ? motionsNow.scale : undefined}
+              movingClipPath={movingClipPath}
               viewModeOffsetX={viewModeOffsetX}
               entryXFrom={entryXFrom}
               entryScaleFrom={entryScaleFrom}
@@ -3225,7 +3262,7 @@ function SwiperLoopCarousel({
         </div>
     );
     return { node, slideClassName, overflowClip };
-  }, [images, realIndex, n, prevViewMode, viewMode, isTransitioningViewMode, isSwipeAnimating, containerWidth, containerHeight, preloader, preloader.version, isPinching, activeIndices, wasActiveMap, viewModeEpoch, slideDirectionRef, getOrCreateImageMotions, renderOverlay, onDownload, imgDraggingIdx, imgOverflowActive, actionsConfig, flyOutAndRemove, startRename, deletingId, renamedMapRef, renameSeq, deletingReshapedRef, onThumbLoaded, devHideMainImage]);
+  }, [images, realIndex, n, prevViewMode, viewMode, isTransitioningViewMode, isSwipeAnimating, containerWidth, containerHeight, preloader, preloader.version, isPinching, activeIndices, wasActiveMap, viewModeEpoch, slideDirectionRef, getOrCreateImageMotions, renderOverlay, onDownload, imgDraggingIdx, imgOverflowActive, actionsConfig, flyOutAndRemove, startRename, deletingId, renamedMapRef, renameSeq, deletingReshapedRef, onThumbLoaded, devHideMainImage, devDisableSurvivorAnim]);
 
   // 非虚拟(<n)：内容包回 SwiperSlide，行为与原来完全一致
   const renderSlideContent = useCallback((index: number) => {
@@ -3531,7 +3568,7 @@ function SwiperLoopCarousel({
           {/* Dev 调试控制面板：仅非生产构建渲染，生产构建整段被 DCE 排除，零运行时开销 */}
           {isDev && (
             <div
-              className="absolute right-3 top-3 z-[60] select-none"
+              className="absolute bottom-24 right-3 z-[60] select-none"
               onClick={(e) => e.stopPropagation()}
               style={{ fontFamily: "ui-monospace, SFMono-Regular, monospace" }}
             >

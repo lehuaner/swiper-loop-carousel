@@ -42,6 +42,11 @@ interface AnimatedSlideImgProps {
    *  删除补位时平移更快/更远，与左侧未缩放图失步。传入本卡的 scale 后，共享位移改为
    *  groupShiftX ÷ scale，使屏幕位移恒定为一格、与缩放无关（未缩放卡 scale=1 不受影响）。 */
   groupShiftScaleX?: import("motion/react").MotionValue<number>;
+  /** 删除补位共享平移期间，施加在本卡内层（随 groupShiftX 平移的同一元素）上的横向裁切。 
+   *  之所以放内层而非外层盒子：被放大/拖拽图删除补位横移时会跨过自身槽位边界，若裁切固定在外层
+   *  槽盒，平移中内容越过中线即被裁掉；裁切跟随平移元素则与"切换 next"（整段平移、裁切随盒走）一致，
+   *  放大图在平移中始终裁剪到其目标槽位、而非漏出到相邻槽位。 */
+  movingClipPath?: string;
   viewModeOffsetX?: number;
   entryXFrom?: number;
   entryScaleFrom?: number;
@@ -91,6 +96,7 @@ export default function AnimatedSlideImg({
   deleteTranslateX,
   groupShiftX,
   groupShiftScaleX,
+  movingClipPath,
   viewModeOffsetX = 0,
   entryXFrom,
   entryScaleFrom,
@@ -549,6 +555,9 @@ export default function AnimatedSlideImg({
         // 无 will-change 时每帧都可能触发主线程图层化/重绘，多个图层不同步即表现为"组件抖动"。
         // 与"切换下一张"只动 wrapper 一个 transform 对齐，保证逐帧只走合成。
         willChange: "transform, opacity",
+        // 删除补位共享平移期间的"随盒裁切"：裁切跟在这一层上，随 groupShiftX 一起平移，
+        // 放大图横移时始终裁剪到目标槽位（与"切换 next"整段平移裁切随盒走一致）。
+        ...(movingClipPath ? { clipPath: movingClipPath, WebkitClipPath: movingClipPath } : {}),
       }}
       className="relative flex h-full w-full items-center justify-center"
     >
