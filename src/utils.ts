@@ -61,6 +61,10 @@ export interface ImageMotions {
   /** 入场/删除补位时的水平位移（由 AnimatedSlideImg 内部驱动）；与顶部名称/功能按钮栏共享，
    *  使名称按钮栏在删除补位时与图片同步平移。 */
   entryX: MotionValue<number>;
+  /** 删除"被吸走"动画：整体透明度（收点时淡出） */
+  opacity: MotionValue<number>;
+  /** 删除"被吸走"动画：整体旋转（轻微旋转，更像被卷走） */
+  rotate: MotionValue<number>;
 }
 
 export interface PreloadedDims {

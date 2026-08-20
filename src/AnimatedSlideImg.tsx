@@ -576,6 +576,7 @@ export default function AnimatedSlideImg({
       )}
       <img
         ref={imgRef}
+        data-carousel-main-img
         src={src}
         alt={alt}
         draggable={false}
