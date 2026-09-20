@@ -759,6 +759,8 @@ function SwiperLoopCarousel({
   const stripDragIdxRafRef = useRef<number | null>(null);
   // 已预加载的缩略图 URL 集合：避免同一 URL 重复 new Image() 预加载
   const thumbPreloadCacheRef = useRef<Set<string>>(new Set());
+  // 删除窗口内为"新入图"缩略图做即时预载的缓存去重：删除入口显式 new Image() 预热，避免重复请求
+  const warmedThumbCacheRef = useRef<Set<string>>(new Set());
   // 缩略图自然尺寸（img.id -> {w,h}）：原图未就绪时，视图切换的缩放补偿（entryScaleFrom）需要按
   // "当前实际显示内容"（缩略图）的宽高比计算，否则退化为 newVM/prevVM 会因宽高比不符而"中心图突然放大"。
   // 以 img.id 为键，避免删除重排后索引漂移。
@@ -1045,6 +1047,9 @@ function SwiperLoopCarousel({
         animate(m.rotate, 14, { duration: 0.4, ease: [0.55, 0, 1, 0.45] });
       };
       // Dev: 关闭"被删图"动画 → 瞬间隐藏 DOM（后续仍走 460ms 重排移除）。
+      // 删除均使用吸入 canvas（被删图网格形变吸入删除钮）。单图模式新入图不在吸入期间同时切换——
+      // 改为吸气完成后（重排时）再播放切换入场（见 reflowIncoming 抑制与 deleteEntryTarget 的 viewMode 门控），
+      // 二者串行、互不遮挡。
       if (devDisableDeleteAnim) {
         m.opacity.set(0);
       } else if (effTarget && effImgEl && effImgEl.isConnected) {
@@ -1087,7 +1092,9 @@ function SwiperLoopCarousel({
       // "被删图右侧所有图左移一格"表达为**一个共享 motion 值** groupShiftX 从 0 → -一格槽距：
       // 右侧每张卡在同一渲染里读取该值 → 视觉上即一次 wrapper 平移级别的平滑整段移动（同一动画源零失步）。
       // 被删图左侧的卡不读取 → 原地不动。与切换同速（0.4s easeOut）、同位移（一整格槽距）。
-      if (index >= wasReal && index < wasReal + viewMode && !devDisableSurvivorAnim) {
+      // 单图（viewMode===1）：无其它可见幸存图需整段左移；新入图在吸入期间保持不动，待吸入完成、
+      // 重排时以"切入场"进入主图位（串行），故单图跳过该共享平移，避免在吸入期间预位移。
+      if (viewMode > 1 && index >= wasReal && index < wasReal + viewMode && !devDisableSurvivorAnim) {
         const gGap = viewMode > 1 ? 8 : 0;
         const gSlotW = containerWidth > 0 ? (containerWidth - (viewMode - 1) * gGap) / viewMode : containerWidth;
         const gShift = containerWidth > 0 ? gSlotW + gGap : 0;
@@ -1127,6 +1134,14 @@ function SwiperLoopCarousel({
       const entering = images[enteringIdx];
       if (entering && !removedIdsRef.current.has(entering.id)) {
         preloader.requestLoad(enteringIdx);
+        // 缩略图同样要在删除窗口内可见：新入图非激活在视口右缘之外，其 <img> 之前按 lazy 未发起
+        // 加载。这里显式预载其缩略图，浏览器缓存随后会立即服务飞入卡片的 <img>（与上面 eager 配合），
+        // 保证飞入的 0.4s 内即有内容、不会"空白滑入后才直接出现"。
+        const enterThumb = entering.thumbSrc;
+        if (enterThumb && !enterThumb.startsWith("blob:")) {
+          warmedThumbCacheRef.current.has(enterThumb) ||
+            (warmedThumbCacheRef.current.add(enterThumb), (new Image() as HTMLImageElement).src = enterThumb);
+        }
       }
       // 立即递增 deleteEpoch：左移补位与飞出同一时刻启动（旧链路在 460ms 重排后才启动，导致两者串行）
       setDeleteEpoch((e) => e + 1);
@@ -1209,13 +1224,15 @@ function SwiperLoopCarousel({
         for (const id of relocateSurvivorFillIdsRef.current.keys()) {
           relocateSurvivorFillIdsRef.current.set(id, settleNow);
         }
-        // incoming（单图/双图/三图一致）的"重排后静置抑制二次入场"在此刻才生效：
-        // 删除窗口内它是 rider+deleteEntryTarget，正在播与切换同源的入场，不能静置；
+        // incoming（双图/三图）的"重排后静置抑制二次入场"在此刻才生效：
+        // 删除窗口内它是 rider+deleteEntryTarget，已播与切换同源的入场，不能静置；
         // 重排提交后它已落位，加入静置集合（此刻刷新为 settleNow），杜绝"落位后 isActive 闪断
-        // 再播一遍入场"（播放两遍切换动画）。它在删除窗口开始时未进集合（见上方注释），
-        // 这里按"进入新末位的那张图"（原 wasReal+viewMode → 重排后变 wasReal）补进。
+        // 再播一遍入场"（播放两遍切换动画），这里按"进入新末位的那张图"（原 wasReal+viewMode → 重排后变 wasReal）补进。
+        // 单图（viewMode===1）：吸入期间新入图未播任何入场（deleteEntryTarget / groupShift 均已按
+        // viewMode===1 关闭），因此重排时**不**静置它 → 它成为唯一活跃中心后正常播放切换入场（"先吸入、
+        // 再切入"串行衔接。见 deleteEntryTarget 与群移的 viewMode 门控）。
         const reflowIncoming = images[wasReal + viewMode];
-        if (reflowIncoming && !removedIdsRef.current.has(reflowIncoming.id)) {
+        if (viewMode > 1 && reflowIncoming && !removedIdsRef.current.has(reflowIncoming.id)) {
           relocateFillIdsRef.current.set(reflowIncoming.id, settleNow);
         }
         // ===== 共享平移：结束动画，但【不立即归零】 =====
@@ -3022,6 +3039,7 @@ function SwiperLoopCarousel({
     // 承担（本卡同时是右侧 rider），故这里只驱动入场视觉(scale/opacity/entryX +0.6格→0)。
     // 重排后(realIndex+viewMode 下标已被后图占据)该卡自然不再命中，静置由 deleteFillTarget 接管。
     const deleteEntryTarget =
+      viewMode > 1 &&
       isOpen &&
       !deletingReshapedRef.current &&
       deletedInActiveRow &&
@@ -3169,7 +3187,11 @@ function SwiperLoopCarousel({
               alt=""
               isActive={isActive}
               wasActive={wasActiveMap.get(index)}
-              loading={index === realIndex ? "eager" : "lazy"}
+              // 删除窗口内"从右侧进入的新图"（deleteEntryTarget）会被驱动同步飞入主图位置，
+              // 但它未激活、处于视口右缘之外，loading=lazy 会因"不在视口内"而不发起加载 → 飞入全程
+              // 无内容（空白），结束后才重新请求 → "直接出现"。故删除入场的新图强制 eager，让它在
+              // 飞入的 0.4s 内尽早用缩略图/分块就绪，可见地滑入（同时与删除动画并行）。
+              loading={index === realIndex || deleteEntryTarget ? "eager" : "lazy"}
               showSpinner={showSpinner}
               downloadProgress={downloadProgress}
               progressKnown={progressKnown}
