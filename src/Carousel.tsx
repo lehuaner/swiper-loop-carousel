@@ -316,6 +316,13 @@ interface ThumbnailItemProps {
 }
 /** 缩略图删除时向上飞出的高度 */
 const THUMB_FLY_UP = THUMB_SIZE + 16;
+/**
+ * 底部缩略图行的恒定高度：所有视图模式统一使用，作为容器高度与缩略图垂直居中基准。
+ * 取单图高亮框高度（CENTER_THUMB_SIZE + 8），既容纳单图放大后的中心图，又保证
+ * 单图↔双/三图切换时容器高度不变 → 缩略图行中心不位移 → 消除 Y 轴跳变。
+ * 高亮边框仍按 viewMode 动画其自身高度（相对容器居中），不影响本行位置。
+ */
+const STRIP_ROW_HEIGHT = CENTER_THUMB_SIZE + 8;
 const ThumbnailItem = React.memo(
   function ThumbnailItem({
     img,
@@ -1778,7 +1785,8 @@ function SwiperLoopCarousel({
           wideCount * THUMB_SIZE + (wideCount - 1) * THUMB_GAP;
         const initialBaseX = (initialStripWidth - THUMB_SIZE) / 2;
         // 根据 viewMode 偏移缩略图条位置，使高亮框内的图片组居中
-        const initialTargetX = initialBaseX - (idx + (vm - 1) / 2) * (THUMB_SIZE + THUMB_GAP) - (vm === 2 ? DUAL_HIGHLIGHT_EXTRA_GAP / 2 : 0);
+        // 对称分配双图额外间距，组中心落在高亮框中心，无需整条回中偏移
+        const initialTargetX = initialBaseX - (idx + (vm - 1) / 2) * (THUMB_SIZE + THUMB_GAP);
         stripX.set(initialTargetX);
         setPendingRealIndex(idx);
         pendingRealIndexRef.current = idx;
@@ -2206,11 +2214,12 @@ function SwiperLoopCarousel({
     Math.min(1, (windowWidth - 32) / STRIP_BASE_WIDTH)
   );
   const STRIP_TARGET_IDX = pendingRealIndex;
+  // 双图额外间距已改为对称分配到两张中心图（见 stripItems 的 extraLeft：左 -EXTRA/2、右 +EXTRA/2），
+  // 组中心仍落在高亮框中心，故此处不再对整条做 -EXTRA/2 回中（否则会使右中心图与右邻间距被压缩）。
   const STRIP_TARGET_X =
     STRIP_BASE_WIDTH / 2 -
     THUMB_SIZE / 2 -
-    (STRIP_TARGET_IDX + (viewMode - 1) / 2) * STRIP_THUMB_PITCH -
-    (viewMode === 2 ? DUAL_HIGHLIGHT_EXTRA_GAP / 2 : 0);
+    (STRIP_TARGET_IDX + (viewMode - 1) / 2) * STRIP_THUMB_PITCH;
 
   // 高亮框尺寸：根据 viewMode 调整高亮缩放倍数（避免重叠）
   const HIGHLIGHT_CENTER_WIDTH = (() => {
@@ -3427,7 +3436,7 @@ function SwiperLoopCarousel({
     const endIdx = Math.min(n - 1, centerIdx + range);
     const thumbActiveTarget = isKeyboardActive ? pendingRealIndex : realIndex;
     const activeScale = isKeyboardActive ? 1 : (viewMode === 1 ? CENTER_SCALE : viewMode === 2 ? 1.15 : 1.1);
-    const stripHeight = viewMode === 1 ? HIGHLIGHT_CENTER_WIDTH : CENTER_THUMB_SIZE;
+    const stripHeight = STRIP_ROW_HEIGHT;
     const cache = stripItemCacheRef.current;
     const newPositions = new Map<number, number>();
     const items = [];
@@ -3451,7 +3460,13 @@ function SwiperLoopCarousel({
       // 不再"先平移到位再按高亮间距二次调整"（现状第二张差 6px 重排时再补位）。
       const finalIdx = bindShift ? i - 1 : i;
       const finalActive = finalIdx >= thumbActiveTarget && finalIdx < thumbActiveTarget + viewMode;
-      const extraLeft = viewMode === 2 && finalActive && finalIdx === thumbActiveTarget + 1 ? DUAL_HIGHLIGHT_EXTRA_GAP : 0;
+      // 双图高亮的额外间距对称分配：左中心图 -EXTRA/2、右中心图 +EXTRA/2。使两张中心图与左右邻缩略图
+      // 的外侧间距相等（否则原实现仅右中心图 +EXTRA 会使右外侧间距被压缩、甚至与右邻重叠）。
+      let extraLeft = 0;
+      if (viewMode === 2 && finalActive) {
+        if (finalIdx === thumbActiveTarget) extraLeft = -DUAL_HIGHLIGHT_EXTRA_GAP / 2;
+        else if (finalIdx === thumbActiveTarget + 1) extraLeft = DUAL_HIGHLIGHT_EXTRA_GAP / 2;
+      }
       const offsetX = i * thumbPitch + extraLeft;
       const oldOffsetX = thumbPositionsRef.current.get(img.id);
       // 删除后索引重排：此项从 oldOffsetX 移到新 offsetX，差值作为挂载动画起点（FLIP 靠拢）
@@ -3755,7 +3770,7 @@ function SwiperLoopCarousel({
               className={`relative z-[60] mt-[17px] shrink-0 overflow-hidden ${isStripDragging && dragMoved ? "cursor-grabbing" : "cursor-grab"}`}
               style={{
                 width: STRIP_BASE_WIDTH,
-                height: viewMode === 1 ? HIGHLIGHT_CENTER_WIDTH : CENTER_THUMB_SIZE,
+                height: STRIP_ROW_HEIGHT,
                 clipPath:
                   STRIP_VISIBLE_COUNT === STRIP_DRAG_VISIBLE
                     ? "inset(0 0 0 0)"
@@ -3775,7 +3790,7 @@ function SwiperLoopCarousel({
                   // 容器宽度从 n*64px 降至 ~41*64px ≈ 2624px，大幅减少合成层面积
                   x: stripX,
                   width: (stripItems.items.length + 1) * (THUMB_SIZE + THUMB_GAP),
-                  height: viewMode === 1 ? HIGHLIGHT_CENTER_WIDTH : CENTER_THUMB_SIZE,
+                  height: STRIP_ROW_HEIGHT,
                   touchAction: "pan-y",
                 }}
               >
