@@ -323,6 +323,12 @@ const THUMB_FLY_UP = THUMB_SIZE + 16;
  * 高亮边框仍按 viewMode 动画其自身高度（相对容器居中），不影响本行位置。
  */
 const STRIP_ROW_HEIGHT = CENTER_THUMB_SIZE + 8;
+/** 吸入动画时长（ms）：被删图 canvas 网格形变吸入删除钮 */
+const DELETE_SUCTION_MS = 1400 / 3.5;
+/** 删除切换动画时长（ms）：吸入结束后右段补位平移 + 新入图入场，与常规切换(0.4s)同源同速 */
+const DELETE_MOTION_MS = 400;
+/** 切换动画结束后、重排提交前的稳定缓冲（ms） */
+const DELETE_SETTLE_BUFFER_MS = 60;
 const ThumbnailItem = React.memo(
   function ThumbnailItem({
     img,
@@ -517,6 +523,8 @@ function SwiperLoopCarousel({
   loadDebounceMs,
   maxTasks,
   theme = "dark",
+  deleteMode = "parallel",
+  debugPanel = false,
 }: {
   images: GalleryImage[];
   onNeedMore?: () => void;
@@ -586,6 +594,11 @@ function SwiperLoopCarousel({
   maxTasks?: number;
   /** 整体配色主题："dark"（默认，黑色控件亮度较纯黑提升 10%）或 "light"（亮色）。调用方可按需切换 */
   theme?: CarouselTheme;
+  /** 多图删除动画时序："parallel"（默认，吸入与图片运动/切换同时）、"serial"（吸入结束后再切换）。
+   *  仅外部通过此参数控制；面板内可视化切换由 debugPanel 提供，不影响外部默认行为。 */
+  deleteMode?: "serial" | "parallel";
+  /** 是否显示右上角 Dev 调试面板（默认 false）。仅显式开启才渲染，外部引用不会出现。 */
+  debugPanel?: boolean;
 }) {
   const t = useCarouselI18n();
   const lang = useCarouselLang();
@@ -599,6 +612,9 @@ function SwiperLoopCarousel({
   const [removeEpoch, setRemoveEpoch] = useState(0);
   // 删除提交后递增：驱动活跃行"未被删除的幸存图"按切换动画重放入场
   const [deleteEpoch, setDeleteEpoch] = useState(0);
+  // 串行删除门控：false=吸入阶段（右段与新入图静止，仅吸入动画在跑），true=切换阶段（入场+补位平移）。
+  // 吸入结束时由 Timer A 置 true，驱动 deleteEntryTarget 生效。
+  const [deleteMotionStarted, setDeleteMotionStarted] = useState(false);
   // 最近一次删除的被删图下标（重排前的原始下标）。渲染时据此判断某图是否位于被删图右侧：
   // 仅右侧幸存图(index >= 该值)重放"下一张"切换动画，左侧幸存图保持不动。
   const lastDeletedIndexRef = useRef<number>(-1);
@@ -740,6 +756,10 @@ function SwiperLoopCarousel({
   // 使 `isDev && ...` 的浮层 JSX 整体被 DCE 排除，状态恒为默认值零开销）=====
   const isDev = process.env.NODE_ENV !== "production";
   const [devPanelOpen, setDevPanelOpen] = useState(false);
+  // Dev 面板对 deleteMode 的临时覆盖（null=不覆盖，沿用 deleteMode prop）。仅供面板实测，不影响外部。
+  const [devSerialOverride, setDevSerialOverride] = useState<boolean | null>(null);
+  // 最终是否串行：dev 覆盖优先，否则取 deleteMode prop（默认 parallel）。
+  const serialAnim = devSerialOverride ?? (deleteMode === "serial");
   // 隐藏底部缩略图条
   const [devHideThumbs, setDevHideThumbs] = useState(false);
   // 关闭"被删除图片"的飞出/吸入动画（改为瞬时移除）
@@ -1015,6 +1035,7 @@ function SwiperLoopCarousel({
       thumbGroupShiftX.set(0);
       thumbGroupShiftAnimRef.current?.stop();
       setDeletingId(img.id);
+      setDeleteMotionStarted(!serialAnim); // 串行:先进吸入阶段(右段与新入图静止);并行:立即 true → 入场/平移同帧触发
       // 上一删除可能仍在"重排已提交"抑制窗口内：新删除必须立即退出该窗口，
       // 否则 deleteShiftActive/deleteEntryTarget 里的 !deletingReshapedRef 判定为假，
       // 本次补位/入场动画整组失效（表现为"原地消失后从右侧飞入"的概率性跳变）。
@@ -1041,8 +1062,8 @@ function SwiperLoopCarousel({
       // 目标 = 删除按钮中心（运行时获取，不写死像素）；卡片尺寸 = 删除前图片的真实可见矩形。
       // 方案B错峰：吸口 canvas 初始化（建 canvas + append 触发 layout、纹理 drawImage、网格顶点构建）
       // 是删除点击帧的主线程重活（trace 里 ~19.5ms 长任务），会挤占右侧平移/缩略图合并动画的首帧。
-      // 先把轻量的右侧平移/缩略图合并（上方 thumbGroupShiftX / 下方 groupShiftX animate）同步送出，
-      // 再在下一帧 rAF 初始化吸口并隐藏 DOM 图：点击帧立即响应动画、不被同步重活打断。
+      // 先把轻量的缩略图合并（thumbGroupShiftX）同步送出（缩略图动画保持原时序不变），主图右段共享平移
+      // groupShiftX 则延后到吸入结束再启动（串行，见 Timer A）；再在下一帧 rAF 初始化吸口并隐藏 DOM 图。
       // suctionOverlay 已做"首帧同步绘制"，故 rAF 回调里 canvas 立即接管画面，不会出现空档。
       const runFallbackSuction = () => {
         const suckX = Math.max(120, containerWidth * 0.38);
@@ -1072,7 +1093,7 @@ function SwiperLoopCarousel({
                     return { x: r.left, y: r.top, w: r.width, h: r.height };
                   })()
                 : undefined;
-            playSuction({ imgEl: effImgEl, target: effTarget, durationMs: 1400 / 3.5, crop });
+            playSuction({ imgEl: effImgEl, target: effTarget, durationMs: DELETE_SUCTION_MS, crop });
             m.opacity.set(0); // 隐藏原 DOM 图，交由 canvas 覆盖层呈现吸入过程
           } else {
             runFallbackSuction();
@@ -1094,22 +1115,23 @@ function SwiperLoopCarousel({
         );
       }
 
-      // ===== 删除发生在活跃行内 → 驱动"右侧整段共享平移"（源码级改造） =====
-      // 不调用 swiper.slideToLoop 去"切到下一张"（那会带动整条 wrapper、连左侧卡一起移）。而是把
-      // "被删图右侧所有图左移一格"表达为**一个共享 motion 值** groupShiftX 从 0 → -一格槽距：
-      // 右侧每张卡在同一渲染里读取该值 → 视觉上即一次 wrapper 平移级别的平滑整段移动（同一动画源零失步）。
-      // 被删图左侧的卡不读取 → 原地不动。与切换同速（0.4s easeOut）、同位移（一整格槽距）。
-      // 单图（viewMode===1）：无其它可见幸存图需整段左移；新入图在吸入期间保持不动，待吸入完成、
-      // 重排时以"切入场"进入主图位（串行），故单图跳过该共享平移，避免在吸入期间预位移。
-      if (viewMode > 1 && index >= wasReal && index < wasReal + viewMode && !devDisableSurvivorAnim) {
-        const gGap = viewMode > 1 ? 8 : 0;
-        const gSlotW = containerWidth > 0 ? (containerWidth - (viewMode - 1) * gGap) / viewMode : containerWidth;
-        const gShift = containerWidth > 0 ? gSlotW + gGap : 0;
-        if (gShift > 0) {
-          groupShiftAnimRef.current?.stop();
-          groupShiftAnimRef.current = animate(groupShiftX, -gShift, { duration: 0.4, ease: "easeOut" });
+      // ===== 删除发生在活跃行内 → 右段"共享平移补位"（串行：吸入结束后才启动） =====
+      // 右侧所有图左移一格表达为共享 motion 值 groupShiftX 从 0 → -一格槽距：右侧每卡读同一值 →
+      // 一次 wrapper 级平滑整段移动（单动画源零失步）；左侧卡不读 → 原地不动。与切换同速、同位移。
+      // 串行观感：吸入阶段 groupShiftX 恒为 0（右段静止），吸入结束（Timer A）才 animate。
+      // 单图（viewMode===1）无其它可见幸存图 → 本就跳过该平移。
+      const beginSwitchMotion = () => {
+        // 并行：与原实现一致，不额外限定 viewMode>1；串行：仅多图需共享平移（单图无右幸存段）。
+        if ((!serialAnim || viewMode > 1) && index >= wasReal && index < wasReal + viewMode && !devDisableSurvivorAnim) {
+          const gGap = viewMode > 1 ? 8 : 0;
+          const gSlotW = containerWidth > 0 ? (containerWidth - (viewMode - 1) * gGap) / viewMode : containerWidth;
+          const gShift = containerWidth > 0 ? gSlotW + gGap : 0;
+          if (gShift > 0) {
+            groupShiftAnimRef.current?.stop();
+            groupShiftAnimRef.current = animate(groupShiftX, -gShift, { duration: DELETE_MOTION_MS / 1000, ease: "easeOut" });
+          }
         }
-      }
+      };
 
       // ===== 删除：目标 =====
       // 被删图自身向上缩小飞出；其右侧整段图由共享 groupShiftX 一次性平滑左移一格（同上 0.4s 同步），
@@ -1150,8 +1172,26 @@ function SwiperLoopCarousel({
             (warmedThumbCacheRef.current.add(enterThumb), (new Image() as HTMLImageElement).src = enterThumb);
         }
       }
-      // 立即递增 deleteEpoch：左移补位与飞出同一时刻启动（旧链路在 460ms 重排后才启动，导致两者串行）
-      setDeleteEpoch((e) => e + 1);
+      // ===== 串行删除时序 =====
+      // 吸入阶段（Timer A 之前）：deleteMotionStarted=false、deleteEpoch 未递增、groupShiftX 未 animate
+      //   → 被删图右侧整段与新入图完全静止，仅吸入动画在跑（吸入时长与当前一致）。
+      // Timer A（吸入结束）：置 deleteMotionStarted → 新入图 deleteEntryTarget 生效播放"切换入场"；
+      //   递增 deleteEpoch（入场一次性触发键）；启动 groupShiftX 右段共享平移补位。
+      // Timer B（切换结束后）：执行下方重排提交体（原 460ms）。
+      // ===== 删除时序：串行(serialAnim) vs 并行(默认) =====
+      // 并行：吸入与图片运动/入场同时——点击帧即递增 deleteEpoch 并启动右段平移（等价改造前原行为）。
+      // 串行：吸入阶段右段与新入图静止，吸入结束(Timer A)才递增 epoch、置 deleteMotionStarted、启动平移。
+      const suctionWait = serialAnim && !devDisableDeleteAnim ? DELETE_SUCTION_MS : 0;
+      if (serialAnim) {
+        window.setTimeout(() => {
+          setDeleteMotionStarted(true);
+          setDeleteEpoch((e) => e + 1);
+          beginSwitchMotion();
+        }, suctionWait);
+      } else {
+        setDeleteEpoch((e) => e + 1);
+        beginSwitchMotion();
+      }
 
       window.setTimeout(() => {
         removedIdsRef.current.add(img.id);
@@ -1239,7 +1279,7 @@ function SwiperLoopCarousel({
         // viewMode===1 关闭），因此重排时**不**静置它 → 它成为唯一活跃中心后正常播放切换入场（"先吸入、
         // 再切入"串行衔接。见 deleteEntryTarget 与群移的 viewMode 门控）。
         const reflowIncoming = images[wasReal + viewMode];
-        if (viewMode > 1 && reflowIncoming && !removedIdsRef.current.has(reflowIncoming.id)) {
+        if ((!serialAnim || viewMode > 1) && reflowIncoming && !removedIdsRef.current.has(reflowIncoming.id)) {
           relocateFillIdsRef.current.set(reflowIncoming.id, settleNow);
         }
         // ===== 共享平移：结束动画，但【不立即归零】 =====
@@ -1365,9 +1405,9 @@ function SwiperLoopCarousel({
           }
           if (!processed) serialDeleteLockRef.current = false; // 队列里没有可删项时才兜底释放
         }, DELETE_SERIAL_BUFFER_MS);
-      }, 460);
+      }, serialAnim ? suctionWait + DELETE_MOTION_MS + DELETE_SETTLE_BUFFER_MS : 460);
     },
-    [deletingId, getOrCreateImageMotions, images, n, viewMode, hasMore, preloader, pruneDeleteFillState, containerWidth, containerHeight, devDisableDeleteAnim, devDisableSurvivorAnim]
+    [deletingId, getOrCreateImageMotions, images, n, viewMode, hasMore, preloader, pruneDeleteFillState, containerWidth, containerHeight, devDisableDeleteAnim, devDisableSurvivorAnim, serialAnim]
   );
   // 队列接力触发的后续删除必须命中"最新"的实现（重排后 images/deletingId 均更新）
   flyOutAndRemoveRef.current = flyOutAndRemove;
@@ -3048,7 +3088,8 @@ function SwiperLoopCarousel({
     // 承担（本卡同时是右侧 rider），故这里只驱动入场视觉(scale/opacity/entryX +0.6格→0)。
     // 重排后(realIndex+viewMode 下标已被后图占据)该卡自然不再命中，静置由 deleteFillTarget 接管。
     const deleteEntryTarget =
-      viewMode > 1 &&
+      (!serialAnim || deleteMotionStarted) &&
+      (!serialAnim || viewMode > 1) &&
       isOpen &&
       !deletingReshapedRef.current &&
       deletedInActiveRow &&
@@ -3337,7 +3378,7 @@ function SwiperLoopCarousel({
         </div>
     );
     return { node, slideClassName, overflowClip };
-  }, [images, realIndex, n, prevViewMode, viewMode, isTransitioningViewMode, isSwipeAnimating, containerWidth, containerHeight, preloader, preloader.version, isPinching, activeIndices, wasActiveMap, viewModeEpoch, slideDirectionRef, getOrCreateImageMotions, renderOverlay, onDownload, imgDraggingIdx, imgOverflowActive, actionsConfig, flyOutAndRemove, startRename, deletingId, renamedMapRef, renameSeq, deletingReshapedRef, onThumbLoaded, devHideMainImage, devDisableSurvivorAnim]);
+  }, [images, realIndex, n, prevViewMode, viewMode, isTransitioningViewMode, isSwipeAnimating, containerWidth, containerHeight, preloader, preloader.version, isPinching, activeIndices, wasActiveMap, viewModeEpoch, slideDirectionRef, getOrCreateImageMotions, renderOverlay, onDownload, imgDraggingIdx, imgOverflowActive, actionsConfig, flyOutAndRemove, startRename, deletingId, renamedMapRef, renameSeq, deletingReshapedRef, onThumbLoaded, devHideMainImage, devDisableSurvivorAnim, deleteMotionStarted, serialAnim]);
 
   // 非虚拟(<n)：内容包回 SwiperSlide，行为与原来完全一致
   const renderSlideContent = useCallback((index: number) => {
@@ -3646,8 +3687,8 @@ function SwiperLoopCarousel({
             />
           </div>
 
-          {/* Dev 调试控制面板：仅非生产构建渲染，生产构建整段被 DCE 排除，零运行时开销 */}
-          {isDev && (
+          {/* Dev 调试控制面板：仅 debugPanel 显式开启且非生产构建时渲染。外部引用默认 debugPanel=false → 面板不出现 */}
+          {isDev && debugPanel && (
             <div
               className="absolute top-16 right-16 z-[60] select-none"
               onClick={(e) => e.stopPropagation()}
@@ -3680,6 +3721,7 @@ function SwiperLoopCarousel({
                 >
                   <div className="mb-0.5 text-[11px] font-bold uppercase tracking-wider opacity-70">调试开关</div>
                   {[
+                    { key: "deleteMode", label: "串行删除（吸入后再切换）", value: serialAnim, set: (v: boolean) => setDevSerialOverride(v) },
                     { key: "devHideThumbs", label: "隐藏底部缩略图条", value: devHideThumbs, set: setDevHideThumbs },
                     { key: "devDisableDeleteAnim", label: "关闭被删除图片动画", value: devDisableDeleteAnim, set: setDevDisableDeleteAnim },
                     { key: "devDisableSurvivorAnim", label: "关闭幸存图补位动画", value: devDisableSurvivorAnim, set: setDevDisableSurvivorAnim },
@@ -4137,6 +4179,8 @@ export default function SwiperLoopCarouselWithErrorBoundary({
   useCache,
   maxCache,
   theme = "dark",
+  deleteMode,
+  debugPanel,
 }: {
   images: GalleryImage[];
   onNeedMore?: () => void;
@@ -4195,10 +4239,14 @@ export default function SwiperLoopCarouselWithErrorBoundary({
   maxCache?: number;
   /** 整体配色主题："dark"（默认）或 "light"（亮色）。调用方可按需切换 */
   theme?: CarouselTheme;
+  /** 多图删除动画时序："parallel"（默认）/ "serial" */
+  deleteMode?: "serial" | "parallel";
+  /** 是否显示 Dev 调试面板（默认 false，外部引用不出现） */
+  debugPanel?: boolean;
 }) {
   return (
     <CarouselErrorBoundary>
-      <SwiperLoopCarousel images={images} onNeedMore={onNeedMore} hasMore={hasMore} renderOverlay={renderOverlay} renderToolbar={renderToolbar} extraToolbarItems={extraToolbarItems} extraOverlayContent={extraOverlayContent} isOpen={isOpen} initialIndex={initialIndex} onClose={onClose} onDownload={onDownload} total={total} persistSettings={persistSettings} actions={actions} renameInputClassName={renameInputClassName} enableConcurrent={enableConcurrent} concurrency={concurrency} minChunkBytes={minChunkBytes} connectRetryMs={connectRetryMs} enableConnectRetry={enableConnectRetry} maxActiveImages={maxActiveImages} preloadRange={preloadRange} useCache={useCache} maxCache={maxCache} theme={theme} />
+      <SwiperLoopCarousel images={images} onNeedMore={onNeedMore} hasMore={hasMore} renderOverlay={renderOverlay} renderToolbar={renderToolbar} extraToolbarItems={extraToolbarItems} extraOverlayContent={extraOverlayContent} isOpen={isOpen} initialIndex={initialIndex} onClose={onClose} onDownload={onDownload} total={total} persistSettings={persistSettings} actions={actions} renameInputClassName={renameInputClassName} enableConcurrent={enableConcurrent} concurrency={concurrency} minChunkBytes={minChunkBytes} connectRetryMs={connectRetryMs} enableConnectRetry={enableConnectRetry} maxActiveImages={maxActiveImages} preloadRange={preloadRange} useCache={useCache} maxCache={maxCache} theme={theme} deleteMode={deleteMode} debugPanel={debugPanel} />
     </CarouselErrorBoundary>
   );
 }

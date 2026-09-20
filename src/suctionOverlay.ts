@@ -1,11 +1,13 @@
 // 删除图片的"吸入"动画（Canvas 覆盖层）
-// 忠实移植自 examples/ui/吸入动画 的核心引擎（真实图像 + 网格三角纹理映射 + 从一角向目标蔓延的形变）。
+// 忠实移植自 examples/ui/吸入动画 的核心引擎（真实图像 + 网格纹理映射 + 从一角向目标蔓延的形变）。
 // 关键适配：
 //   - 卡片坐标/尺寸 = 运行时图片的"删除前真实可见矩形"（按 object-contain 计算内容框，非元素外框、不写死像素）。
 //   - 目标 = 被点删除按钮中心（运行时获取，不写死像素）。
 //   - 纹理直接用已加载的 DOM <img> 同步生成，避免 new Image 重新加载带来的异步闪烁。
-//   - 网格密度 cols 受 MAX_GRID(35) 约束；行数按图片宽高比推算（最终也 ≤ 35 量级）。
-//   - 真实 DOM 删除按钮已存在，因此不绘制示例里的垃圾桶本体，仅保留吸入口漩涡 + 光锥 + 光晕氛围。
+//   - 网格密度 cols 受 MAX_GRID(20) 约束；行数按图片宽高比推算（最终也 ≤ 20 量级）。
+//   - 真实 DOM 删除按钮已存在，因此不绘制示例里的垃圾桶本体，仅保留图片被吸入的形变。
+// 渲染：优先 WebGL（GPU 一次 drawArrays 完成网格纹理映射 + 变暗），WebGL 不可用时回退 Canvas2D 逐三角贴图。
+//   两渲染器读取同一份形变顶点、同一张纹理，输出逐像素一致；形变算法为"版本1：波前蔓延"。
 
 export interface SuctionTarget {
   x: number; // 视口坐标
@@ -31,12 +33,133 @@ export interface SuctionOptions {
 
 const TEX_SCALE = 2; // 纹理分辨率 = 卡片显示尺寸 × 2（清晰且对视网膜屏友好）
 const MAX_GRID = 20; // 需求约束：网格密度不超过 20
-const FRONT = 0.45; // 形变前沿蔓延速度（与示例一致）
+const FRONT = 0.45; // 版本1：形变前沿蔓延速度（远处顶点需等波前到达才开始动）
 const TINY = 0.05; // 顶点收束到目标附近的比例
 const FLAT = 0.55; // 纵向压扁
 
 function easeInOut(t: number): number {
   return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+}
+
+type Vert = { x: number; y: number };
+
+// ===== WebGL 吸入网格渲染器 =====
+// 顶点位置（视口坐标→裁剪坐标）每帧从形变后的 card.vertices 重建；uv 为静态（仅由网格决定）。
+// 一次 drawArrays 画完 cols×rows×2 三角形，纹理仿射映射与 Canvas2D 逐三角贴图逐像素等价。
+// 变暗（进入瓶中越深越暗）在 fragment 里对不透明图做 rgb×(1-dark) 乘法，等效旧"叠加半透明黑"。
+function createSuctionGL(
+  gl: WebGLRenderingContext,
+  texCanvas: HTMLCanvasElement,
+  boxW: number,
+  boxH: number,
+  cols: number,
+  rows: number,
+  minX: number,
+  minY: number,
+): ((vertices: Vert[][], dark: number) => void) | null {
+  const vsSrc =
+    "attribute vec2 aPos; attribute vec2 aUV; varying vec2 vUV;" +
+    "void main(){ vUV=aUV; gl_Position=vec4(aPos,0.0,1.0); }";
+  const fsSrc =
+    "precision mediump float; varying vec2 vUV; uniform sampler2D uTex; uniform float uDark;" +
+    "void main(){ vec4 c=texture2D(uTex,vUV); gl_FragColor=vec4(c.rgb*(1.0-uDark)*c.a, c.a); }";
+  const compile = (type: number, src: string): WebGLShader | null => {
+    const s = gl.createShader(type);
+    if (!s) return null;
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      gl.deleteShader(s);
+      return null;
+    }
+    return s;
+  };
+  const vs = compile(gl.VERTEX_SHADER, vsSrc);
+  const fs = compile(gl.FRAGMENT_SHADER, fsSrc);
+  if (!vs || !fs) return null;
+  const prog = gl.createProgram();
+  if (!prog) return null;
+  gl.attachShader(prog, vs);
+  gl.attachShader(prog, fs);
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return null;
+  gl.useProgram(prog);
+  const aPos = gl.getAttribLocation(prog, "aPos");
+  const aUV = gl.getAttribLocation(prog, "aUV");
+  const uTexLoc = gl.getUniformLocation(prog, "uTex");
+  const uDarkLoc = gl.getUniformLocation(prog, "uDark");
+
+  const nv = cols * rows * 2 * 3;
+  // 静态 uv（每三角形 3 顶点，格点 uv = 列/行占比）
+  const uv = new Float32Array(nv * 2);
+  let ui = 0;
+  for (let r = 0; r < rows; r++) {
+    const v0 = r / rows, v1 = (r + 1) / rows;
+    for (let c = 0; c < cols; c++) {
+      const u0 = c / cols, u1 = (c + 1) / cols;
+      // T1=(d0,d1,d2)=(u0,v0)(u1,v0)(u1,v1)
+      uv[ui++] = u0; uv[ui++] = v0;
+      uv[ui++] = u1; uv[ui++] = v0;
+      uv[ui++] = u1; uv[ui++] = v1;
+      // T2=(d0,d2,d3)=(u0,v0)(u1,v1)(u0,v1)
+      uv[ui++] = u0; uv[ui++] = v0;
+      uv[ui++] = u1; uv[ui++] = v1;
+      uv[ui++] = u0; uv[ui++] = v1;
+    }
+  }
+  const pos = new Float32Array(nv * 2); // 每帧重建
+
+  const posBuf = gl.createBuffer();
+  const uvBuf = gl.createBuffer();
+  const texture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, texCanvas);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, uv, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(aUV);
+  gl.vertexAttribPointer(aUV, 2, gl.FLOAT, false, 0, 0);
+
+  gl.disable(gl.DEPTH_TEST);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA); // premultiplied
+  gl.clearColor(0, 0, 0, 0);
+  gl.uniform1i(uTexLoc, 0);
+
+  return (vertices: Vert[][], dark: number) => {
+    // 视口坐标 → 包围盒裁剪坐标（canvas 覆盖 [minX,minY] 起 boxW×boxH）
+    let pi = 0;
+    for (let r = 0; r < rows; r++) {
+      const vr = vertices[r], vr1 = vertices[r + 1];
+      for (let c = 0; c < cols; c++) {
+        const d0 = vr[c], d1 = vr[c + 1], d2 = vr1[c + 1], d3 = vr1[c];
+        // T1 = (d0, d1, d2)
+        pos[pi++] = (d0.x - minX) / boxW * 2 - 1; pos[pi++] = 1 - (d0.y - minY) / boxH * 2;
+        pos[pi++] = (d1.x - minX) / boxW * 2 - 1; pos[pi++] = 1 - (d1.y - minY) / boxH * 2;
+        pos[pi++] = (d2.x - minX) / boxW * 2 - 1; pos[pi++] = 1 - (d2.y - minY) / boxH * 2;
+        // T2 = (d0, d2, d3)
+        pos[pi++] = (d0.x - minX) / boxW * 2 - 1; pos[pi++] = 1 - (d0.y - minY) / boxH * 2;
+        pos[pi++] = (d2.x - minX) / boxW * 2 - 1; pos[pi++] = 1 - (d2.y - minY) / boxH * 2;
+        pos[pi++] = (d3.x - minX) / boxW * 2 - 1; pos[pi++] = 1 - (d3.y - minY) / boxH * 2;
+      }
+    }
+    gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(prog);
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, pos, gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+    gl.uniform1f(uDarkLoc, dark);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.drawArrays(gl.TRIANGLES, 0, nv);
+  };
 }
 
 export function playSuction(opts: SuctionOptions): void {
@@ -70,8 +193,7 @@ export function playSuction(opts: SuctionOptions): void {
     return;
   }
   // 卡片 clamp 到"框定区域"（crop）：被删图被缩放/拖拽到超边界时，形变卡片限制在可见区内，
-  // 删除动画不突破拖拽边界。目标点若在 crop 外（按钮在边界外），也 clamp 到 crop 内，
-  // 避免吸入口顶点目标越界。
+  // 删除动画不突破拖拽边界。目标点若在 crop 外（按钮在边界外），也 clamp 到 crop 内。
   if (crop) {
     const cx0 = crop.x, cy0 = crop.y, cx1 = crop.x + crop.w, cy1 = crop.y + crop.h;
     const ic0x = Math.max(cardX, cx0), ic0y = Math.max(cardY, cy0);
@@ -91,7 +213,6 @@ export function playSuction(opts: SuctionOptions): void {
   // 画布只覆盖"卡片矩形 + 吸入目标点"的包围盒，而非整屏。
   // 全屏 canvas 在高分屏（如 4K@2dpr = 7680×4320）会同步分配上百 MB 的 backing store，
   // 并在 append 时触发整页 layout——这正是删除点击里那 ~78ms 长任务的主因。
-  // 实际形变只发生在卡片内，整屏画布 99% 是空的，缩小后分配/每帧 clear 都快一个数量级。
   const PAD = 24; // 形变溢出到目标点方向的余量
   const minX = Math.floor(Math.min(cardX, targetCenter.x) - PAD);
   const minY = Math.floor(Math.min(cardY, targetCenter.y) - PAD);
@@ -111,16 +232,6 @@ export function playSuction(opts: SuctionOptions): void {
   canvas.style.zIndex = "2147483646";
   canvas.style.pointerEvents = "none";
   document.body.appendChild(canvas);
-
-  const ctx = canvas.getContext("2d");
-  if (!ctx) {
-    canvas.remove();
-    onDone?.();
-    return;
-  }
-  ctx.scale(dpr, dpr);
-  // 把视口坐标平移到包围盒原点：后续所有绘制仍用视口坐标（card/target 等），无需改动
-  ctx.translate(-minX, -minY);
 
   let raf = 0;
   let finished = false;
@@ -145,24 +256,30 @@ export function playSuction(opts: SuctionOptions): void {
   const th = tex.height;
   const siw = iw || cardW;
   const sih = ih || cardH;
-  const s = Math.max(tw / siw, th / sih); // cover 填充：保持原图比例、铺满整张卡片
-  const dw = siw * s;
-  const dh = sih * s;
+  const cover = Math.max(tw / siw, th / sih); // cover 填充：保持原图比例、铺满整张卡片
+  const dw = siw * cover;
+  const dh = sih * cover;
   tctx.drawImage(imgEl, (tw - dw) / 2, (th - dh) / 2, dw, dh);
+
+  // 污染检测：跨域且未带 CORS 许可的图片被 drawImage 进纹理 canvas 后，canvas 即被"污染"(tainted)。
+  // WebGL 的 texImage2D 需要从 canvas 读取像素，对污染 canvas 会直接抛 SecurityError；
+  // Canvas2D 回退渲染只做"绘制"（drawImage 不读回像素），不受污染限制。
+  // 用 1 像素 getImageData 探测（污染时抛 SecurityError），污染则强制走 Canvas2D，保证删除动画不中断。
+  let texTainted = false;
+  try {
+    tctx.getImageData(0, 0, 1, 1);
+  } catch {
+    texTainted = true;
+  }
 
   const rows = Math.max(3, Math.min(MAX_GRID, Math.round(cols * (cardH / cardW))));
 
   // 卡片（on-screen 图片"删除前"真实可见矩形）
   const card = {
-    x: cardX,
-    y: cardY,
-    w: cardW,
-    h: cardH,
-    cols,
-    rows,
+    x: cardX, y: cardY, w: cardW, h: cardH, cols, rows,
     center: { x: cardX + cardW / 2, y: cardY + cardH / 2 },
-    vertices: [] as { x: number; y: number }[][],
-    origVertices: [] as { x: number; y: number }[][],
+    vertices: [] as Vert[][],
+    origVertices: [] as Vert[][],
     frontDist: [] as number[][],
     startCol: 0,
     startRow: 0,
@@ -170,8 +287,8 @@ export function playSuction(opts: SuctionOptions): void {
   };
 
   for (let r = 0; r <= rows; r++) {
-    const vr: { x: number; y: number }[] = [];
-    const or: { x: number; y: number }[] = [];
+    const vr: Vert[] = [];
+    const or: Vert[] = [];
     for (let c = 0; c <= cols; c++) {
       vr.push({ x: card.x + (c / cols) * card.w, y: card.y + (r / rows) * card.h });
       or.push({ x: card.x + (c / cols) * card.w, y: card.y + (r / rows) * card.h });
@@ -180,55 +297,16 @@ export function playSuction(opts: SuctionOptions): void {
     card.origVertices.push(or);
   }
 
-  // ===== 方案A：三角常量预计算（源矩形外扩1px + 仿射矩阵分母）=====
-  // 每单元格两个三角形：源三角形坐标、裁剪源矩形、分母都是常量，初始化时一次性算好；
-  // 每帧 drawCardMesh 只依据当前变形后的目标顶点计算仿射矩阵并绘制，显著降低主线程每帧成本。
-  const TRI_PAD = 1.5; // 目标外扩防接缝（与旧 drawTexTri 内部 PAD 一致）
-  interface TriConst {
-    sx0: number; sy0: number; sx1: number; sy1: number; sx2: number; sy2: number;
-    ssx: number; ssy: number; ssw: number; ssh: number; denom: number;
-  }
-  const triCache: TriConst[][] = [];
-  for (let r = 0; r < rows; r++) {
-    const rowTri: TriConst[] = [];
-    for (let c = 0; c < cols; c++) {
-      const s0x = (c / cols) * tw, s0y = (r / rows) * th;
-      const s1x = ((c + 1) / cols) * tw, s1y = s0y;
-      const s2x = s1x, s2y = ((r + 1) / rows) * th;
-      const s3x = s0x, s3y = s2y;
-      const minx = Math.max(0, Math.min(s0x, s1x, s2x, s3x) - 1);
-      const miny = Math.max(0, Math.min(s0y, s1y, s2y, s3y) - 1);
-      const maxx = Math.min(tw, Math.max(s0x, s1x, s2x, s3x) + 1);
-      const maxy = Math.min(th, Math.max(s0y, s1y, s2y, s3y) + 1);
-      const mk = (ax: number, ay: number, bx: number, by: number, cx2: number, cy: number): TriConst => ({
-        sx0: ax, sy0: ay, sx1: bx, sy1: by, sx2: cx2, sy2: cy,
-        ssx: minx, ssy: miny, ssw: maxx - minx, ssh: maxy - miny,
-        denom: (bx - ax) * (cy - ay) - (by - ay) * (cx2 - ax) || 1e-6,
-      });
-      rowTri.push(mk(s0x, s0y, s1x, s1y, s2x, s2y));
-      rowTri.push(mk(s0x, s0y, s2x, s2y, s3x, s3y));
-    }
-    triCache.push(rowTri);
-  }
-
   // 选离目标（删除按钮中心）最近的角为"起始吸入角"，并缓存每顶点前沿距离
   const pickStartCorner = () => {
-    const corners: [number, number][] = [
-      [0, 0],
-      [cols, 0],
-      [0, rows],
-      [cols, rows],
-    ];
+    const corners: [number, number][] = [[0, 0], [cols, 0], [0, rows], [cols, rows]];
     let best = corners[0];
     let bestD = Infinity;
     for (const [c, r] of corners) {
       const ox = card.x + (c / cols) * card.w;
       const oy = card.y + (r / rows) * card.h;
       const d = Math.hypot(ox - targetCenter.x, oy - targetCenter.y);
-      if (d < bestD) {
-        bestD = d;
-        best = [c, r];
-      }
+      if (d < bestD) { bestD = d; best = [c, r]; }
     }
     card.startCol = best[0];
     card.startRow = best[1];
@@ -242,13 +320,12 @@ export function playSuction(opts: SuctionOptions): void {
   };
   pickStartCorner();
 
-  // 核心形变（版本2）：点击后所有顶点同时启动飞向目标；按到起始角的距离给不同速度——
-  // 近处（靠近删除按钮）更快到达，远处更慢，仍保留"排队到达"观感，但无"等波前"的静止等待。
+  // 核心形变（版本1：波前蔓延）：形变前沿沿对角线从起始角扫过整图，
+  // 远处顶点要等波前到达才开始飞向目标（"排队启动"），近处先动。
   const updateVertices = (progress: number) => {
     const tx = targetCenter.x;
     const ty = targetCenter.y;
     const TC = card.center;
-    const SPEED_K = 2.4; // 版本2：近处块的加速倍率（越大，排队到达感越强）
     for (let r = 0; r <= rows; r++) {
       const fdRow = card.frontDist[r];
       const vRow = card.vertices[r];
@@ -256,8 +333,7 @@ export function playSuction(opts: SuctionOptions): void {
       for (let c = 0; c <= cols; c++) {
         const o = oRow[c];
         const d = fdRow[c]; // 0=起始角(近) 1=对角(远)
-        const speed = 1 + (1 - d) * (SPEED_K - 1); // 近处快、远处慢，均于 progress=1 前到达
-        let lp = progress * speed;
+        let lp = (progress - d * (1 - FRONT)) / FRONT; // 波前扫过：远处需等波前到达
         lp = lp < 0 ? 0 : lp > 1 ? 1 : lp;
         lp = easeInOut(lp);
         const nx = tx + (o.x - TC.x) * TINY;
@@ -269,97 +345,140 @@ export function playSuction(opts: SuctionOptions): void {
     }
   };
 
-  // 三角纹理映射（方案A）：用预计算常量 + 每帧目标顶点算仿射矩阵。
-  // 目标三角形做 TRI_PAD 外扩防接缝（把纹理映射到外扩后的目标，等效旧"裁剪到外扩三角形"）。
-  // 不再每三角 save/clip/restore（每帧最多 ~2·cols·rows 次状态入栈/裁剪），改用
-  // setTransform(基变换) + transform(仿射) 直接绘制——显著降低主线程每帧成本。
-  const drawTexTriFast = (
-    t: TriConst,
-    d0: { x: number; y: number },
-    d1: { x: number; y: number },
-    d2: { x: number; y: number },
-  ) => {
-    const { sx0, sy0, sx1, sy1, sx2, sy2, ssx, ssy, ssw, ssh, denom } = t;
-    const cx = (d0.x + d1.x + d2.x) / 3;
-    const cy = (d0.y + d1.y + d2.y) / 3;
-    const expand = (vx: number, vy: number): [number, number] => {
-      const ex = vx - cx;
-      const ey = vy - cy;
-      const l = Math.hypot(ex, ey) || 1;
-      return [vx + (ex / l) * TRI_PAD, vy + (ey / l) * TRI_PAD];
-    };
-    const a = expand(d0.x, d0.y);
-    const b = expand(d1.x, d1.y);
-    const c2 = expand(d2.x, d2.y);
-    const m11 = ((b[0] - a[0]) * (sy2 - sy0) - (c2[0] - a[0]) * (sy1 - sy0)) / denom;
-    const m12 = ((c2[0] - a[0]) * (sx1 - sx0) - (b[0] - a[0]) * (sx2 - sx0)) / denom;
-    const m21 = ((b[1] - a[1]) * (sy2 - sy0) - (c2[1] - a[1]) * (sy1 - sy0)) / denom;
-    const m22 = ((c2[1] - a[1]) * (sx1 - sx0) - (b[1] - a[1]) * (sx2 - sx0)) / denom;
-    const mtx = a[0] - (m11 * sx0 + m12 * sy0);
-    const mty = a[1] - (m21 * sx0 + m22 * sy0);
-    // 重置到基变换（dpr + 平移包围盒原点），再叠加仿射；clip 由外层 drawCardMesh 的卡片多边形统一负责
-    ctx.setTransform(dpr, 0, 0, dpr, -minX * dpr, -minY * dpr);
-    ctx.transform(m11, m21, m12, m22, mtx, mty);
-    ctx.drawImage(tex, ssx, ssy, ssw, ssh, ssx, ssy, ssw, ssh);
-  };
-
-  const drawCardMesh = (progress: number) => {
-    const { vertices } = card;
+  // 变暗系数（进入瓶中越深越暗）
+  const darkOf = (progress: number) => {
     const k = Math.pow(1 - progress, 1.6) * 0.95 + 0.05;
-    const dark = 1 - (0.55 + 0.45 * k);
-
-    // 裁剪到卡片多边形，防外扩三角溢出
-    const clipPath = () => {
-      ctx.beginPath();
-      ctx.moveTo(vertices[0][0].x, vertices[0][0].y);
-      for (let c = 1; c <= cols; c++) ctx.lineTo(vertices[0][c].x, vertices[0][c].y);
-      for (let r = 1; r <= rows; r++) ctx.lineTo(vertices[r][cols].x, vertices[r][cols].y);
-      for (let c = cols - 1; c >= 0; c--) ctx.lineTo(vertices[rows][c].x, vertices[rows][c].y);
-      for (let r = rows - 1; r >= 0; r--) ctx.lineTo(vertices[r][0].x, vertices[r][0].y);
-      ctx.closePath();
-    };
-    ctx.save();
-    clipPath();
-    ctx.clip();
-    for (let r = 0; r < rows; r++) {
-      const triRow = triCache[r];
-      const vRow = vertices[r];
-      const vNext = vertices[r + 1];
-      for (let c = 0; c < cols; c++) {
-        const d0 = vRow[c];
-        const d1 = vRow[c + 1];
-        const d2 = vNext[c + 1];
-        const d3 = vNext[c];
-        drawTexTriFast(triRow[c * 2], d0, d1, d2);
-        drawTexTriFast(triRow[c * 2 + 1], d0, d2, d3);
-      }
-    }
-    ctx.restore();
-
-    if (dark > 0.01) {
-      ctx.save();
-      clipPath();
-      ctx.fillStyle = `rgba(0,0,0,${dark})`;
-      ctx.fill();
-      ctx.restore();
-    }
+    return 1 - (0.55 + 0.45 * k);
   };
 
-  // 吸入口：已移除螺旋漩涡、光晕与光锥，仅保留图片被吸入的形变
-  const drawMouth = (_progress: number) => {};
+  // ===== 选择渲染器：WebGL 优先，失败回退 Canvas2D =====
+  // 注意：纹理被污染时必须在此处（首次 getContext）就跳过申请 WebGL 上下文——
+  // 同一 canvas 一旦先取得 webgl 上下文，后续 getContext("2d") 将返回 null，回退渲染器会失效。
+  let glRender: ((vertices: Vert[][], dark: number) => void) | null = null;
+  const gl =
+    (!texTainted &&
+      canvas.getContext("webgl", {
+        alpha: true,
+        premultipliedAlpha: true,
+        antialias: false,
+        depth: false,
+        stencil: false,
+        preserveDrawingBuffer: false,
+      })) ||
+    null;
+  if (gl) glRender = createSuctionGL(gl, tex, boxW, boxH, cols, rows, minX, minY);
+
+  // ---- Canvas2D 回退（逐三角贴图）：仅在 WebGL 不可用时启用 ----
+  let ctx: CanvasRenderingContext2D | null = null;
+  let drawCardMesh2D: ((progress: number) => void) | null = null;
+  if (!glRender) {
+    ctx = canvas.getContext("2d");
+    if (!ctx) {
+      finish();
+      return;
+    }
+    ctx.scale(dpr, dpr);
+    ctx.translate(-minX, -minY); // 视口坐标平移至包围盒原点，后续绘制仍用视口坐标
+
+    // 三角常量预计算（源矩形外扩1px + 仿射分母），每帧只按变形顶点算仿射矩阵
+    const TRI_PAD = 1.5;
+    interface TriConst {
+      sx0: number; sy0: number; sx1: number; sy1: number; sx2: number; sy2: number;
+      ssx: number; ssy: number; ssw: number; ssh: number; denom: number;
+    }
+    const triCache: TriConst[][] = [];
+    for (let r = 0; r < rows; r++) {
+      const rowTri: TriConst[] = [];
+      for (let c = 0; c < cols; c++) {
+        const s0x = (c / cols) * tw, s0y = (r / rows) * th;
+        const s1x = ((c + 1) / cols) * tw, s1y = s0y;
+        const s2x = s1x, s2y = ((r + 1) / rows) * th;
+        const s3x = s0x, s3y = s2y;
+        const minx = Math.max(0, Math.min(s0x, s1x, s2x, s3x) - 1);
+        const miny = Math.max(0, Math.min(s0y, s1y, s2y, s3y) - 1);
+        const maxx = Math.min(tw, Math.max(s0x, s1x, s2x, s3x) + 1);
+        const maxy = Math.min(th, Math.max(s0y, s1y, s2y, s3y) + 1);
+        const mk = (ax: number, ay: number, bx: number, by: number, cx2: number, cy: number): TriConst => ({
+          sx0: ax, sy0: ay, sx1: bx, sy1: by, sx2: cx2, sy2: cy,
+          ssx: minx, ssy: miny, ssw: maxx - minx, ssh: maxy - miny,
+          denom: (bx - ax) * (cy - ay) - (by - ay) * (cx2 - ax) || 1e-6,
+        });
+        rowTri.push(mk(s0x, s0y, s1x, s1y, s2x, s2y));
+        rowTri.push(mk(s0x, s0y, s2x, s2y, s3x, s3y));
+      }
+      triCache.push(rowTri);
+    }
+
+    const c2 = ctx;
+    const drawTexTriFast = (t: TriConst, d0: Vert, d1: Vert, d2: Vert) => {
+      const { sx0, sy0, sx1, sy1, sx2, sy2, ssx, ssy, ssw, ssh, denom } = t;
+      const ccx = (d0.x + d1.x + d2.x) / 3;
+      const ccy = (d0.y + d1.y + d2.y) / 3;
+      let ex, ey, l;
+      ex = d0.x - ccx; ey = d0.y - ccy; l = Math.hypot(ex, ey) || 1; const a0x = d0.x + (ex / l) * TRI_PAD, a0y = d0.y + (ey / l) * TRI_PAD;
+      ex = d1.x - ccx; ey = d1.y - ccy; l = Math.hypot(ex, ey) || 1; const b0x = d1.x + (ex / l) * TRI_PAD, b0y = d1.y + (ey / l) * TRI_PAD;
+      ex = d2.x - ccx; ey = d2.y - ccy; l = Math.hypot(ex, ey) || 1; const c0x = d2.x + (ex / l) * TRI_PAD, c0y = d2.y + (ey / l) * TRI_PAD;
+      const m11 = ((b0x - a0x) * (sy2 - sy0) - (c0x - a0x) * (sy1 - sy0)) / denom;
+      const m12 = ((c0x - a0x) * (sx1 - sx0) - (b0x - a0x) * (sx2 - sx0)) / denom;
+      const m21 = ((b0y - a0y) * (sy2 - sy0) - (c0y - a0y) * (sy1 - sy0)) / denom;
+      const m22 = ((c0y - a0y) * (sx1 - sx0) - (b0y - a0y) * (sx2 - sx0)) / denom;
+      const mtx = a0x - (m11 * sx0 + m12 * sy0);
+      const mty = a0y - (m21 * sx0 + m22 * sy0);
+      c2.setTransform(dpr, 0, 0, dpr, -minX * dpr, -minY * dpr);
+      c2.transform(m11, m21, m12, m22, mtx, mty);
+      c2.drawImage(tex, ssx, ssy, ssw, ssh, ssx, ssy, ssw, ssh);
+    };
+
+    drawCardMesh2D = (progress: number) => {
+      const { vertices } = card;
+      const dark = darkOf(progress);
+      const clipPath = () => {
+        c2.beginPath();
+        c2.moveTo(vertices[0][0].x, vertices[0][0].y);
+        for (let c = 1; c <= cols; c++) c2.lineTo(vertices[0][c].x, vertices[0][c].y);
+        for (let r = 1; r <= rows; r++) c2.lineTo(vertices[r][cols].x, vertices[r][cols].y);
+        for (let c = cols - 1; c >= 0; c--) c2.lineTo(vertices[rows][c].x, vertices[rows][c].y);
+        for (let r = rows - 1; r >= 0; r--) c2.lineTo(vertices[r][0].x, vertices[r][0].y);
+        c2.closePath();
+      };
+      c2.save();
+      clipPath();
+      c2.clip();
+      for (let r = 0; r < rows; r++) {
+        const triRow = triCache[r];
+        const vRow = vertices[r];
+        const vNext = vertices[r + 1];
+        for (let c = 0; c < cols; c++) {
+          const d0 = vRow[c], d1 = vRow[c + 1], d2 = vNext[c + 1], d3 = vNext[c];
+          drawTexTriFast(triRow[c * 2], d0, d1, d2);
+          drawTexTriFast(triRow[c * 2 + 1], d0, d2, d3);
+        }
+      }
+      c2.restore();
+      if (dark > 0.01) {
+        c2.save();
+        clipPath();
+        c2.fillStyle = `rgba(0,0,0,${dark})`;
+        c2.fill();
+        c2.restore();
+      }
+    };
+  }
+
+  const clear2D = () => ctx!.clearRect(minX, minY, boxW, boxH);
+  const drawFrame = (progress: number) => {
+    updateVertices(progress);
+    if (glRender) glRender(card.vertices, darkOf(progress));
+    else if (drawCardMesh2D) { clear2D(); drawCardMesh2D(progress); }
+  };
 
   // 首帧同步绘制，避免 rAF 延迟造成的 1 帧空档（被删图已隐藏，canvas 尚未就绪 → 白屏一瞬）
-  updateVertices(0);
-  drawCardMesh(0);
-  drawMouth(0);
+  drawFrame(0);
 
   const start = performance.now();
   const loop = (now: number) => {
     const progress = Math.min(1, (now - start) / durationMs);
-    ctx.clearRect(minX, minY, boxW, boxH);
-    updateVertices(progress);
-    drawCardMesh(progress);
-    drawMouth(progress);
+    drawFrame(progress);
     if (progress < 1) raf = requestAnimationFrame(loop);
     else finish();
   };
