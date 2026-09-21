@@ -67,6 +67,9 @@ interface AnimatedSlideImgProps {
   /** 原图是否已在 preloader 中就绪（displaySrc 就是原图）。为 true 时新实例直接以原图显示、
    *  跳过底层缩略图的加载淡入——删除重排后重挂载的幸存图原图已就绪，避免平移到位瞬间闪现缩略图。 */
   originalReady?: boolean;
+  /** 单图并行删除：新入图入场不做 opacity 淡入（直接不透明，仅缩放+滑入）。
+   *  否则半透明入场期会把正下方那张不透明的吸入旧图“透”出来当背景 → 主体看不到新图（仅边缘可见）。 */
+  entryNoFade?: boolean;
   /** 该图的缩略图 key（通常为 img.thumbSrc）。原图未就绪时主 <img> 内容即为缩略图，
    *  其加载完成（含缓存命中）与底层缩略图 <img> 加载完成都会触发 onThumbLoaded(key)。
    *  父组件据此判断"切换动画期间缩略图已就位 → 用缩略图兜底、不再叠加转圈"。 */
@@ -109,6 +112,7 @@ export default function AnimatedSlideImg({
   progressKnown = false,
   entryX: entryXProp,
   originalReady = false,
+  entryNoFade = false,
   thumbKey,
   onThumbLoaded,
 }: AnimatedSlideImgProps) {
@@ -530,7 +534,8 @@ export default function AnimatedSlideImg({
     const offset = entryXOffset ?? 60;
     const dir = slideDirectionRef?.current ?? 1;
     entryScale.set(0.25);
-    entryOpacity.set(0);
+    // 单图并行(entryNoFade)：新图入场不淡入、直接不透明 → 实体盖住下方吸入旧图，主体可见；否则保留与切换同源的淡入。
+    entryOpacity.set(entryNoFade ? 1 : 0);
     entryX.set(offset * dir);
     allAnimRef.current = [
       animate(entryScale, 1, { duration: 0.4, ease: "easeOut" }),
@@ -538,7 +543,7 @@ export default function AnimatedSlideImg({
       animate(entryX, targetX, { duration: 0.4, ease: "easeOut" }),
     ];
     void currentEpoch;
-  }, [deleteEpoch, deleteEntryTarget, deleteTranslateX, viewModeOffsetX, entryXOffset, slideDirectionRef, entryX, entryScale, entryOpacity, cleanupAllAnims]);
+  }, [deleteEpoch, deleteEntryTarget, deleteTranslateX, viewModeOffsetX, entryXOffset, slideDirectionRef, entryX, entryScale, entryOpacity, cleanupAllAnims, entryNoFade]);
 
   // 当前 src 是否为"原图"（与底层缩略图不同）。是则等原图加载完成后再淡出缩略图，
   // 切换期间缩略图常驻底层，彻底消除黑屏闪烁。

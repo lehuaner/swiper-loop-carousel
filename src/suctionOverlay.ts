@@ -29,6 +29,10 @@ export interface SuctionOptions {
   crop?: { x: number; y: number; w: number; h: number };
   /** 完成回调（用于衔接删除提交流程） */
   onDone?: () => void;
+  /** （可选）吸入层挂载容器（需为定位祖先且为层叠上下文，如 containerRef）。
+   *  传入时 canvas 以 position:absolute 挂进容器、坐标由视口换算为容器内、z-index:-1
+   *  → 落在容器背景之上、卡片之下（新入图不被遮挡）。不传则保持挂 body + fixed + 最大 z（原行为）。 */
+  container?: HTMLElement;
 }
 
 const TEX_SCALE = 2; // 纹理分辨率 = 卡片显示尺寸 × 2（清晰且对视网膜屏友好）
@@ -163,7 +167,7 @@ function createSuctionGL(
 }
 
 export function playSuction(opts: SuctionOptions): void {
-  const { imgEl, target, gridCols = 18, durationMs = 1400, crop, onDone } = opts;
+  const { imgEl, target, gridCols = 18, durationMs = 1400, crop, onDone, container } = opts;
   const cols = Math.max(3, Math.min(MAX_GRID, Math.round(gridCols)));
   const targetCenter = { x: target.x, y: target.y };
 
@@ -224,14 +228,26 @@ export function playSuction(opts: SuctionOptions): void {
   const canvas = document.createElement("canvas");
   canvas.width = Math.floor(boxW * dpr);
   canvas.height = Math.floor(boxH * dpr);
-  canvas.style.position = "fixed";
-  canvas.style.left = minX + "px";
-  canvas.style.top = minY + "px";
+  // 内部绘制坐标始终基于视口（通过 translate(-minX,-minY)/包围盒裁剪）。
+  // 定位：有 container → absolute 挂容器，元素左上 = 视口(minX,minY) 换算为容器内 (minX-cLeft,minY-cTop)，
+  //        z-index:-1（容器已为层叠上下文 → 落在容器背景之上、卡片之下，新入图盖住吸入不被遮挡）；
+  //        无 container → fixed 挂 body（原行为，最大 z）。
+  if (container) {
+    const cRect = container.getBoundingClientRect();
+    canvas.style.position = "absolute";
+    canvas.style.left = minX - cRect.left + "px";
+    canvas.style.top = minY - cRect.top + "px";
+    canvas.style.zIndex = "-1";
+  } else {
+    canvas.style.position = "fixed";
+    canvas.style.left = minX + "px";
+    canvas.style.top = minY + "px";
+    canvas.style.zIndex = "2147483646";
+  }
   canvas.style.width = boxW + "px";
   canvas.style.height = boxH + "px";
-  canvas.style.zIndex = "2147483646";
   canvas.style.pointerEvents = "none";
-  document.body.appendChild(canvas);
+  (container ?? document.body).appendChild(canvas);
 
   let raf = 0;
   let finished = false;

@@ -286,6 +286,7 @@ const MemoAnimatedSlideImg = React.memo(
     prev.entryScaleFrom === next.entryScaleFrom &&
     prev.entryXOffset === next.entryXOffset &&
     prev.isExitingOnViewModeChange === next.isExitingOnViewModeChange &&
+    prev.entryNoFade === next.entryNoFade &&
     prev.showSpinner === next.showSpinner &&
     prev.downloadProgress === next.downloadProgress &&
     prev.progressKnown === next.progressKnown &&
@@ -1093,7 +1094,16 @@ function SwiperLoopCarousel({
                     return { x: r.left, y: r.top, w: r.width, h: r.height };
                   })()
                 : undefined;
-            playSuction({ imgEl: effImgEl, target: effTarget, durationMs: DELETE_SUCTION_MS, crop });
+            playSuction({
+              imgEl: effImgEl,
+              target: effTarget,
+              durationMs: DELETE_SUCTION_MS,
+              crop,
+              // 单图+并行：吸入层挂 .swiper（wrapper 的直接父），z-index:-1 → 与 wrapper(z auto=0) 同处 .swiper 上下文，
+              // wrapper 整体稳定盖住吸入层 → 新入图(在 wrapper 内)不被遮挡；避开吸入挂进 wrapper 的 transform 上下文造成的堆叠歧义。
+              // 其余（多图/串行）传 undefined → 维持挂 body + fixed + 最大 z（行为零变）。
+              container: !serialAnim && viewMode === 1 ? (swiperRef.current?.el ?? undefined) : undefined,
+            });
             m.opacity.set(0); // 隐藏原 DOM 图，交由 canvas 覆盖层呈现吸入过程
           } else {
             runFallbackSuction();
@@ -3094,6 +3104,8 @@ function SwiperLoopCarousel({
       !deletingReshapedRef.current &&
       deletedInActiveRow &&
       index === realIndex + viewMode;
+    // 单图+并行：新入图入场不淡入（直接不透明），避免半透明期透出下方不透明的吸入旧图 → 主体看不到新图。
+    const entryNoFade = !serialAnim && viewMode === 1 && deleteEntryTarget;
     // 该图当前是否被缩放/拖拽而贴到滑片边界。是则给图片施加边缘淡出遮罩，
     // 让贴边/即将被裁剪的部分呈现半透明软过渡，而非一条生硬的裁剪线。
     // 滑片仍保持 overflow-hidden，各图片不会拖进相邻图片。
@@ -3131,7 +3143,9 @@ function SwiperLoopCarousel({
     // 判定（右幸存图左移一格 → relIdx-1，与切换 next 落位一致）：随盒平移中始终裁剪到目标槽位，
     // 放大图多余的横向溢出不会越过中线漏到相邻卡。
     let movingClipPath: string | undefined;
-    if (rider && !devDisableSurvivorAnim) {
+    // 单图并行的“进入图”(deleteEntryTarget)不裁：它整格在屏幕右侧一屏外，groupShiftX 把图左移进中央，
+    // 若仍按自身盒裁切会把图裁死在右格里（只露一条缝）→ 必须放开才能飞进中央。
+    if (rider && !devDisableSurvivorAnim && !(viewMode === 1 && deleteEntryTarget)) {
       if (viewMode > 1) {
         const landRel = relIdx - 1; // 右幸存图左移一格后落位
         const landInRow = landRel < viewMode;
@@ -3194,7 +3208,7 @@ function SwiperLoopCarousel({
     // 用订阅式 imgOverflowActive（真实监听 scale/x/y 变化并触发重渲染）而非渲染期读
     // motionsNow.scale.get()（滚轮缩放只改 motion 值不触发重渲染，会停留在旧值 → 必须拖一次才透图）。
     // 单图模式下可见滑片即 realIndex，imgOverflowActive 恰反映它，故可直接使用。
-    const overflowClip = viewMode === 1 && !isTransitioningViewMode && !imgOverflowActive;
+    const overflowClip = viewMode === 1 && !isTransitioningViewMode && !imgOverflowActive && !deleteEntryTarget;
     const slideClassName = `!flex h-full min-h-0 items-center justify-center${overflowClip ? " !overflow-hidden" : ""}`;
     const node: React.ReactElement = (
         <div
@@ -3270,6 +3284,7 @@ function SwiperLoopCarousel({
               deleteFillTarget={deleteFillTarget}
               deleteFillSettledAt={fillSettledAt}
               deleteEntryTarget={deleteEntryTarget}
+              entryNoFade={entryNoFade}
               deleteTranslateX={deleteTranslateX}
               groupShiftX={rider ? groupShiftX : undefined}
               groupShiftScaleX={rider ? motionsNow.scale : undefined}
@@ -3632,10 +3647,13 @@ function SwiperLoopCarousel({
             </div>
           )}
 
+          {/* 吸入层容器：isolation:isolate 强制本容器为层叠上下文 → 吸入层 z-index:-1 稳定落在
+              “容器背景之上、所有卡片之下”：旧 DOM 图 opacity0 透明→吸入透出；进入卡不透明→盖其上。
+              不改任何卡片 position/z（避免破坏入场 motion）。 */}
           <div
             ref={containerRef}
             className="relative flex items-center justify-center overflow-hidden"
-            style={swiperContainerStyle}
+            style={{ ...swiperContainerStyle, isolation: "isolate" }}
             onTouchStart={handleTouchStart}
             onTouchMove={handleTouchMove}
             onTouchEnd={handleTouchEnd}
