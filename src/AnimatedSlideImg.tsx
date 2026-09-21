@@ -167,6 +167,13 @@ export default function AnimatedSlideImg({
   const imgRef = useRef<HTMLImageElement>(null);
   const [imgLoaded, setImgLoaded] = useState(() => originalReady === true);
   const imgLoadedRef = useRef(originalReady === true);
+  // 独立信号：仅当“原图”(src!==underlaySrc) 真正加载/解码完成才为 true（不被缩略图 onLoad 污染）。
+  // 用于：底层缩略图常驻到原图就绪(!originalLoaded)、原图在其上单向淡入叠加（中间永远有缩略图垫底→无黑）。
+  const [originalLoaded, setOriginalLoaded] = useState(() => originalReady === true);
+  const originalLoadedRef = useRef(originalReady === true);
+  // 底层缩略图“延迟卸载”标志：原图淡入(0.2s)真正结束后才置 true。
+  // 若底层在 originalLoaded(淡入开始) 时就卸载，淡入中途主图仍半透明 → 透出黑底。故需多存活一个淡入时长。
+  const [underlayGone, setUnderlayGone] = useState(() => originalReady === true);
 
   // 通知父级"缩略图已就位"：幂等（父级用 Set 去重），触发时机=底层缩略图加载完成 / 主图是缩略图时的加载完成。
   const notifyThumbLoaded = useCallback(() => {
@@ -177,6 +184,11 @@ export default function AnimatedSlideImg({
     if (!imgLoadedRef.current) {
       imgLoadedRef.current = true;
       setImgLoaded(true);
+    }
+    // 当前加载的是“原图”(src 已切到非缩略图) → 置 originalLoaded，允许原图淡入。
+    if (src !== underlaySrc && !originalLoadedRef.current) {
+      originalLoadedRef.current = true;
+      setOriginalLoaded(true);
     }
     // 主 <img> 当前内容若是缩略图（原图未就绪时 displaySrc===thumbSrc），加载完成即缩略图就位；
     // 已是原图时缩略图必然经 underlay/缓存路径通知过，此处通知幂等、安全。
@@ -189,6 +201,7 @@ export default function AnimatedSlideImg({
     if (img && img.complete && img.naturalWidth > 0) {
       imgLoadedRef.current = true;
       setImgLoaded(true);
+      if (src !== underlaySrc) { originalLoadedRef.current = true; setOriginalLoaded(true); }
       // 主 <img> 当前内容若是缩略图（原图未就绪时 displaySrc===thumbSrc），缓存命中即缩略图就位
       if (src === underlaySrc) notifyThumbLoaded();
     }
@@ -202,6 +215,8 @@ export default function AnimatedSlideImg({
       prevSrcRef.current = src;
       imgLoadedRef.current = false;
       setImgLoaded(false);
+      originalLoadedRef.current = false;
+      setOriginalLoaded(false);
       // src 换成已在缓存中的原图（关闭分块时是原生 URL、开启时是 blob）时，
       // load 事件可能在 React 重新绑定 onLoad 前就已同步触发而丢失，
       // 导致 imgLoaded 永远为 false、原图停在 opacity:0，视觉上“被缩略图盖住”。
@@ -210,10 +225,21 @@ export default function AnimatedSlideImg({
       if (img && img.complete && img.naturalWidth > 0) {
         imgLoadedRef.current = true;
         setImgLoaded(true);
+        if (src !== underlaySrc) { originalLoadedRef.current = true; setOriginalLoaded(true); }
         if (src === underlaySrc) notifyThumbLoaded();
       }
     }
   }, [src, underlaySrc, notifyThumbLoaded]);
+
+  // 原图就绪(originalLoaded)后，等主图 0.2s 淡入真正结束再卸载底层缩略图；
+  // 未就绪（或 src 变化重置）时立即恢复底层常驻，保证淡入全程下方都有缩略图垫底→无黑。
+  useEffect(() => {
+    if (originalLoaded) {
+      const id = setTimeout(() => setUnderlayGone(true), 250);
+      return () => clearTimeout(id);
+    }
+    setUnderlayGone(false);
+  }, [originalLoaded]);
 
   // 统一追踪所有运行中的动画，确保快速切换时能全部取消
   const allAnimRef = useRef<ReturnType<typeof animate>[]>([]);
@@ -556,7 +582,9 @@ export default function AnimatedSlideImg({
   //   - src 还是缩略图阶段：主图(上层 z5) 即该缩略图、opacity1 盖住底层，无视觉差异，底层趁机已加载就绪；
   //   - src 切到原图、主图 opacity 转 0：底层缩略图早已就绪无缝兜底 → 原图 onLoad 后淡入，无空白帧。
   // 原图已就绪（originalReady，如重排后右幸存图）时不渲染底层，避免"重挂载后闪现缩略图"。
-  const showUnderlay = Boolean(underlaySrc) && !originalReady;
+  // 底层缩略图常驻：直到“原图淡入真正结束”(underlayGone) 才卸载。淡入全程它始终在 → 中间永无黑底。
+  // 重挂载幸存图 underlayGone 初值=originalReady=true → 不渲染底层，保留原防闪意图。
+  const showUnderlay = Boolean(underlaySrc) && !underlayGone;
   const spinnerVisible = showSpinner ?? (isOriginal && !imgLoaded && !originalReady);
   return (
     <motion.div
@@ -627,7 +655,9 @@ export default function AnimatedSlideImg({
         onLoad={handleImgLoad}
         onClick={(e) => e.stopPropagation()}
         style={{
-          opacity: originalReady || !isOriginal || imgLoaded ? 1 : 0,
+          // 原图阶段未加载完 → opacity 0（露下方常驻缩略图，不黑）；originalLoaded 后 0→1 单向淡入盖过缩略图。
+          // 不是“交叉淡入”（缩略图不淡出），故中间不会透出黑底。缩略图阶段(!isOriginal)直接 1。
+          opacity: originalLoaded || !isOriginal ? 1 : 0,
           transition: "opacity 0.2s ease-in",
         }}
         className="relative z-[5] h-full w-full select-none object-contain cursor-grab active:cursor-grabbing"
