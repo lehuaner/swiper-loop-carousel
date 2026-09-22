@@ -6,7 +6,7 @@ import { motion, AnimatePresence, useMotionValue, animate, MotionValue } from "m
 import { Swiper, SwiperSlide } from "swiper/react";
 import { Virtual } from "swiper/modules";
 import type { Swiper as SwiperClass } from "swiper";
-import { playSuction } from "./suctionOverlay";
+import { playSuction, warmupSuction } from "./suctionOverlay";
 
 // 连续删除时，排队项没有点击事件上下文，且 DOM 已因前序删除重排；按幻灯片索引从 DOM 实时解析
 // 删除按钮中心（吸入目标）与该幻灯片主图（网格形变纹理来源）。循环/虚拟模式下同 index 可能有
@@ -769,6 +769,10 @@ function SwiperLoopCarousel({
   const [devDisableSurvivorAnim, setDevDisableSurvivorAnim] = useState(false);
   // 隐藏主图（大图本身）
   const [devHideMainImage, setDevHideMainImage] = useState(false);
+  // Dev：关闭吸入层 WebGL 上下文池（回退每次新建上下文，供 A/B 对比性能）
+  const [devDisableSuctionPool, setDevDisableSuctionPool] = useState(false);
+  // Dev：吸入画布用满分辨率（关闭 L1 按面积降采样），供 A/B 对比每帧 GPU fill/帧率
+  const [devSuctionFullRes, setDevSuctionFullRes] = useState(false);
   // 用于检测 isKeyboardActive 是否刚从 true→false（长按松开），避免挂载时误触恢复逻辑
   const prevHoldRef = useRef(false);
   const [pendingRealIndex, setPendingRealIndex] = useState(0);
@@ -1099,6 +1103,8 @@ function SwiperLoopCarousel({
               target: effTarget,
               durationMs: DELETE_SUCTION_MS,
               crop,
+              poolOverlay: !devDisableSuctionPool,
+              fullRenderScale: devSuctionFullRes,
               // 单图+并行：吸入层挂 .swiper（wrapper 的直接父），z-index:-1 → 与 wrapper(z auto=0) 同处 .swiper 上下文，
               // wrapper 整体稳定盖住吸入层 → 新入图(在 wrapper 内)不被遮挡；避开吸入挂进 wrapper 的 transform 上下文造成的堆叠歧义。
               // 其余（多图/串行）传 undefined → 维持挂 body + fixed + 最大 z（行为零变）。
@@ -1417,7 +1423,7 @@ function SwiperLoopCarousel({
         }, DELETE_SERIAL_BUFFER_MS);
       }, serialAnim ? suctionWait + DELETE_MOTION_MS + DELETE_SETTLE_BUFFER_MS : 460);
     },
-    [deletingId, getOrCreateImageMotions, images, n, viewMode, hasMore, preloader, pruneDeleteFillState, containerWidth, containerHeight, devDisableDeleteAnim, devDisableSurvivorAnim, serialAnim]
+    [deletingId, getOrCreateImageMotions, images, n, viewMode, hasMore, preloader, pruneDeleteFillState, containerWidth, containerHeight, devDisableDeleteAnim, devDisableSurvivorAnim, devDisableSuctionPool, devSuctionFullRes, serialAnim]
   );
   // 队列接力触发的后续删除必须命中"最新"的实现（重排后 images/deletingId 均更新）
   flyOutAndRemoveRef.current = flyOutAndRemove;
@@ -2806,6 +2812,10 @@ function SwiperLoopCarousel({
       initialLoadRef.current = true;
     }
   }, []);
+  // 对话框打开时预热一个 WebGL 上下文（池化首个），令首次删除也不承担上下文创建开销
+  useEffect(() => {
+    if (isOpen) warmupSuction();
+  }, [isOpen]);
   const handleSlideChange = useCallback((s: SwiperClass) => {
     if (s.destroyed) return;
     // canSlide 删除的 Swiper 复位期间：整体忽略 slideChange（slideToLoop 中间循环位会
@@ -3746,6 +3756,8 @@ function SwiperLoopCarousel({
                     { key: "devDisableDeleteAnim", label: "关闭被删除图片动画", value: devDisableDeleteAnim, set: setDevDisableDeleteAnim },
                     { key: "devDisableSurvivorAnim", label: "关闭幸存图补位动画", value: devDisableSurvivorAnim, set: setDevDisableSurvivorAnim },
                     { key: "devHideMainImage", label: "隐藏主图", value: devHideMainImage, set: setDevHideMainImage },
+                    { key: "devDisableSuctionPool", label: "关闭吸入上下文池(A/B)", value: devDisableSuctionPool, set: setDevDisableSuctionPool },
+                    { key: "devSuctionFullRes", label: "吸入用满分辨率(关L1)", value: devSuctionFullRes, set: setDevSuctionFullRes },
                   ].map(({ key, label, value, set }) => (
                     <label
                       key={key}

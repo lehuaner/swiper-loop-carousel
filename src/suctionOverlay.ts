@@ -33,12 +33,18 @@ export interface SuctionOptions {
    *  传入时 canvas 以 position:absolute 挂进容器、坐标由视口换算为容器内、z-index:-1
    *  → 落在容器背景之上、卡片之下（新入图不被遮挡）。不传则保持挂 body + fixed + 最大 z（原行为）。 */
   container?: HTMLElement;
+  /** （可选）本次是否启用 WebGL 上下文池复用。undefined → 用模块级开关；false → 强制每次新建上下文(旧行为，供 A/B)。 */
+  poolOverlay?: boolean;
+  /** （可选）true → 关闭吸入画布按面积降采样(L1)，用满 dpr（供 Dev 面板 A/B 对比观感/帧率）。 */
+  fullRenderScale?: boolean;
 }
 
-const TEX_SCALE = 2; // 纹理分辨率 = 卡片显示尺寸 × 2（但受 MAX_TEX_EDGE 上限约束）
 // ===== 性能护栏（75Hz/高刷屏下保吸入满帧：削 GPU 每帧合成与首帧上传成本，0.4s 形变观感无损）=====
 const MAX_DPR = 1.5; // 吸入 canvas backing store 的 dpr 上限（形变动画无需满 dpr；backing 面积随 dpr² 降）
-const MAX_TEX_EDGE = 1600; // 吸入纹理长边像素上限（texImage2D 上传量封顶；小图仍保留 2×，大图自动降倍率）
+// L1 大画布降采样：把吸入 canvas 的 backing 总像素封顶到预算内，削每帧 GPU fill（实测全屏大卡每帧 GPUTask 12–20ms 超过 75Hz 预算）。
+const RENDER_PIXEL_BUDGET = 2_000_000; // backing 总像素预算（≈1414×1414）；小于此不降，大卡按面积自动降 dpr
+const RENDER_DPR_FLOOR = 0.75; // 超大画布降采样下限（再低观感开始可察）
+const MAX_TEX_EDGE = 1600; // 吸入纹理长边像素上限（texImage2D 上传量封顶；纹理另按有效 dpr 生成，大图再受此二次封顶）
 const MAX_GRID = 20; // 需求约束：网格密度不超过 20
 const FRONT = 0.45; // 版本1：形变前沿蔓延速度（远处顶点需等波前到达才开始动）
 const TINY = 0.05; // 顶点收束到目标附近的比例
@@ -67,12 +73,102 @@ function bezierEase(x: number, c: number[]): number {
 
 type Vert = { x: number; y: number };
 
-// ===== WebGL 吸入网格渲染器 =====
+// ===== WebGL 上下文对象池（消除每次删除新建 WebGL 上下文/驱动/显存分配造成的 GPU 线程 ~60-70ms 一次性 stall）=====
+// 复用"同一张 canvas 上的 webgl 上下文"：canvas 在池内常驻、删除间挂回/摘下（不销毁），getContext 命中既有上下文不再触发驱动初始化。
+// 并发删除超出池容量时，临时新建一张(用完即弃)以保证同时刻互不覆盖；纹理被污染(taint)走 Canvas2D，不入此池。
+interface GLCanvasCache {
+  canvas: HTMLCanvasElement;
+  gl: WebGLRenderingContext;
+  prog: WebGLProgram;
+  aPos: number; aUV: number; uTex: WebGLUniformLocation | null; uDark: WebGLUniformLocation | null;
+  posBuf: WebGLBuffer; uvBuf: WebGLBuffer; texture: WebGLTexture;
+  inUse: boolean;
+}
+const GL_POOL_MAX = 4;
+const glCanvasPool: GLCanvasCache[] = [];
+let suctionPoolEnabled = true; // Dev 开关：关闭则回退"每次新建上下文"旧行为(供实测 A/B)
+const GL_ATTRS: WebGLContextAttributes = { alpha: true, premultipliedAlpha: true, antialias: false, depth: false, stencil: false, preserveDrawingBuffer: false };
+const SUCTION_VS =
+  "attribute vec2 aPos; attribute vec2 aUV; varying vec2 vUV;" +
+  "void main(){ vUV=aUV; gl_Position=vec4(aPos,0.0,1.0); }";
+const SUCTION_FS =
+  "precision mediump float; varying vec2 vUV; uniform sampler2D uTex; uniform float uDark;" +
+  "void main(){ vec4 c=texture2D(uTex,vUV); gl_FragColor=vec4(c.rgb*(1.0-uDark)*c.a, c.a); }";
+
+function buildSuctionProgram(gl: WebGLRenderingContext): WebGLProgram | null {
+  const compile = (type: number, src: string): WebGLShader | null => {
+    const s = gl.createShader(type);
+    if (!s) return null;
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { gl.deleteShader(s); return null; }
+    return s;
+  };
+  const vs = compile(gl.VERTEX_SHADER, SUCTION_VS);
+  const fs = compile(gl.FRAGMENT_SHADER, SUCTION_FS);
+  if (!vs || !fs) return null;
+  const prog = gl.createProgram();
+  if (!prog) return null;
+  gl.attachShader(prog, vs);
+  gl.attachShader(prog, fs);
+  gl.linkProgram(prog);
+  gl.deleteShader(vs);
+  gl.deleteShader(fs);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return null;
+  return prog;
+}
+
+function newGlCanvas(pooled: boolean): GLCanvasCache | null {
+  const canvas = document.createElement("canvas");
+  canvas.style.pointerEvents = "none";
+  const gl = canvas.getContext("webgl", GL_ATTRS);
+  if (!gl) return null;
+  const prog = buildSuctionProgram(gl);
+  if (!prog) return null;
+  const aPos = gl.getAttribLocation(prog, "aPos");
+  const aUV = gl.getAttribLocation(prog, "aUV");
+  const uTex = gl.getUniformLocation(prog, "uTex");
+  const uDark = gl.getUniformLocation(prog, "uDark");
+  const posBuf = gl.createBuffer();
+  const uvBuf = gl.createBuffer();
+  const texture = gl.createTexture();
+  if (!posBuf || !uvBuf || !texture) return null;
+  gl.useProgram(prog);
+  gl.disable(gl.DEPTH_TEST);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  gl.clearColor(0, 0, 0, 0);
+  gl.uniform1i(uTex, 0);
+  const o: GLCanvasCache = { canvas, gl, prog, aPos, aUV, uTex, uDark, posBuf, uvBuf, texture, inUse: false };
+  if (pooled) glCanvasPool.push(o);
+  return o;
+}
+function acquireGLCanvas(enabled: boolean): GLCanvasCache | null {
+  if (enabled) {
+    for (const o of glCanvasPool) if (!o.inUse) { o.inUse = true; return o; }
+    if (glCanvasPool.length < GL_POOL_MAX) { const o = newGlCanvas(true); if (o) o.inUse = true; return o; }
+  }
+  return newGlCanvas(false); // 禁用池或池满 → 临时(用完即弃)
+}
+function releaseGLCanvas(o: GLCanvasCache | null): void {
+  if (!o) return;
+  o.canvas.remove();
+  if (o.inUse && glCanvasPool.indexOf(o) >= 0) o.inUse = false; // 归还池
+  else { try { o.gl.getExtension("WEBGL_lose_context")?.loseContext(); } catch { /* 临时上下文丢弃 */ } }
+}
+// 预热：在对话框打开/空闲时提前建好一个上下文，令首次删除也不承担创建开销。
+export function warmupSuction(): void {
+  if (!suctionPoolEnabled) return;
+  if (glCanvasPool.length === 0) newGlCanvas(true);
+}
+// Dev 运行时开关池化（A/B 对比）
+export function setSuctionPoolEnabled(v: boolean): void { suctionPoolEnabled = v; }
+
+// ===== WebGL 吸入网格渲染器（复用池中 context/program/buffer/texture，仅重传纹理 + 重建顶点）=====
 // 顶点位置（视口坐标→裁剪坐标）每帧从形变后的 card.vertices 重建；uv 为静态（仅由网格决定）。
 // 一次 drawArrays 画完 cols×rows×2 三角形，纹理仿射映射与 Canvas2D 逐三角贴图逐像素等价。
-// 变暗（进入瓶中越深越暗）在 fragment 里对不透明图做 rgb×(1-dark) 乘法，等效旧"叠加半透明黑"。
-function createSuctionGL(
-  gl: WebGLRenderingContext,
+function setupGLRender(
+  o: GLCanvasCache,
   texCanvas: HTMLCanvasElement,
   boxW: number,
   boxH: number,
@@ -81,37 +177,14 @@ function createSuctionGL(
   minX: number,
   minY: number,
 ): ((vertices: Vert[][], dark: number) => void) | null {
-  const vsSrc =
-    "attribute vec2 aPos; attribute vec2 aUV; varying vec2 vUV;" +
-    "void main(){ vUV=aUV; gl_Position=vec4(aPos,0.0,1.0); }";
-  const fsSrc =
-    "precision mediump float; varying vec2 vUV; uniform sampler2D uTex; uniform float uDark;" +
-    "void main(){ vec4 c=texture2D(uTex,vUV); gl_FragColor=vec4(c.rgb*(1.0-uDark)*c.a, c.a); }";
-  const compile = (type: number, src: string): WebGLShader | null => {
-    const s = gl.createShader(type);
-    if (!s) return null;
-    gl.shaderSource(s, src);
-    gl.compileShader(s);
-    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-      gl.deleteShader(s);
-      return null;
-    }
-    return s;
-  };
-  const vs = compile(gl.VERTEX_SHADER, vsSrc);
-  const fs = compile(gl.FRAGMENT_SHADER, fsSrc);
-  if (!vs || !fs) return null;
-  const prog = gl.createProgram();
-  if (!prog) return null;
-  gl.attachShader(prog, vs);
-  gl.attachShader(prog, fs);
-  gl.linkProgram(prog);
-  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return null;
-  gl.useProgram(prog);
-  const aPos = gl.getAttribLocation(prog, "aPos");
-  const aUV = gl.getAttribLocation(prog, "aUV");
-  const uTexLoc = gl.getUniformLocation(prog, "uTex");
-  const uDarkLoc = gl.getUniformLocation(prog, "uDark");
+  const gl = o.gl;
+  const prog = o.prog;
+  const posBuf = o.posBuf;
+  const uvBuf = o.uvBuf;
+  const texture = o.texture;
+  const aPos = o.aPos;
+  const aUV = o.aUV;
+  const uDarkLoc = o.uDark;
 
   const nv = cols * rows * 2 * 3;
   // 静态 uv（每三角形 3 顶点，格点 uv = 列/行占比）
@@ -133,12 +206,14 @@ function createSuctionGL(
   }
   const pos = new Float32Array(nv * 2); // 每帧重建
 
-  const posBuf = gl.createBuffer();
-  const uvBuf = gl.createBuffer();
-  const texture = gl.createTexture();
+  gl.useProgram(prog);
   gl.bindTexture(gl.TEXTURE_2D, texture);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, texCanvas);
+  try {
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, texCanvas);
+  } catch {
+    return null;
+  }
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
@@ -153,7 +228,6 @@ function createSuctionGL(
   gl.enable(gl.BLEND);
   gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA); // premultiplied
   gl.clearColor(0, 0, 0, 0);
-  gl.uniform1i(uTexLoc, 0);
 
   return (vertices: Vert[][], dark: number) => {
     // 视口坐标 → 包围盒裁剪坐标（canvas 覆盖 [minX,minY] 起 boxW×boxH）
@@ -187,7 +261,7 @@ function createSuctionGL(
 }
 
 export function playSuction(opts: SuctionOptions): void {
-  const { imgEl, target, gridCols = 18, durationMs = 1400, crop, onDone, container } = opts;
+  const { imgEl, target, gridCols = 18, durationMs = 1400, crop, onDone, container, poolOverlay, fullRenderScale } = opts;
   const cols = Math.max(3, Math.min(MAX_GRID, Math.round(gridCols)));
   const targetCenter = { x: target.x, y: target.y };
 
@@ -241,11 +315,7 @@ export function playSuction(opts: SuctionOptions): void {
     targetCenter.y = Math.max(cy0, Math.min(cy1, targetCenter.y));
   }
 
-  const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
-
-  // 画布只覆盖"卡片矩形 + 吸入目标点"的包围盒，而非整屏。
-  // 全屏 canvas 在高分屏（如 4K@2dpr = 7680×4320）会同步分配上百 MB 的 backing store，
-  // 并在 append 时触发整页 layout——这正是删除点击里那 ~78ms 长任务的主因。
+  // 画布只覆盖"卡片矩形 + 吸入目标点"的包围盒，而非整屏（避免超大 backing store + append 时整页 layout）。
   const PAD = 24; // 形变溢出到目标点方向的余量
   const minX = Math.floor(Math.min(cardX, targetCenter.x) - PAD);
   const minY = Math.floor(Math.min(cardY, targetCenter.y) - PAD);
@@ -254,29 +324,20 @@ export function playSuction(opts: SuctionOptions): void {
   const boxW = Math.max(1, maxX - minX);
   const boxH = Math.max(1, maxY - minY);
 
-  const canvas = document.createElement("canvas");
-  canvas.width = Math.floor(boxW * dpr);
-  canvas.height = Math.floor(boxH * dpr);
-  // 内部绘制坐标始终基于视口（通过 translate(-minX,-minY)/包围盒裁剪）。
-  // 定位：有 container → absolute 挂容器，元素左上 = 视口(minX,minY) 换算为容器内 (minX-cLeft,minY-cTop)，
-  //        z-index:-1（容器已为层叠上下文 → 落在容器背景之上、卡片之下，新入图盖住吸入不被遮挡）；
-  //        无 container → fixed 挂 body（原行为，最大 z）。
-  if (container) {
-    const cRect = container.getBoundingClientRect();
-    canvas.style.position = "absolute";
-    canvas.style.left = minX - cRect.left + "px";
-    canvas.style.top = minY - cRect.top + "px";
-    canvas.style.zIndex = "-1";
-  } else {
-    canvas.style.position = "fixed";
-    canvas.style.left = minX + "px";
-    canvas.style.top = minY + "px";
-    canvas.style.zIndex = "2147483646";
+  // 吸入渲染分辨率(L1)：默认把 canvas backing 总像素封顶到 RENDER_PIXEL_BUDGET。吸入是 0.4s 快速收拢的瞬时动画，
+  // 全屏大卡满 dpr 时"每帧 GPU fill"实测达 12–20ms（75Hz 预算 13.3ms → 掉帧主因）。按面积降 dpr 后 fill/上传随 dpr² 下降，
+  // 小卡(<预算)完全不受影响、观感零变化；大卡降到预算内（瞬时收拢肉眼几乎无损）。fullRenderScale=true 关闭降采样(供 A/B)。
+  let dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
+  if (!fullRenderScale) {
+    const cssPx = boxW * boxH;
+    if (cssPx * dpr * dpr > RENDER_PIXEL_BUDGET) {
+      dpr = Math.max(RENDER_DPR_FLOOR, Math.sqrt(RENDER_PIXEL_BUDGET / cssPx));
+    }
   }
-  canvas.style.width = boxW + "px";
-  canvas.style.height = boxH + "px";
-  canvas.style.pointerEvents = "none";
-  (container ?? document.body).appendChild(canvas);
+
+  // 展示层 canvas/上下文：延连到“污染检测”后按后端(WebGL 池 / Canvas2D 临时)获取，此处仅前向声明。
+  let canvas: HTMLCanvasElement | null = null;
+  let glCache: GLCanvasCache | null = null;
 
   let raf = 0;
   let finished = false;
@@ -284,15 +345,16 @@ export function playSuction(opts: SuctionOptions): void {
     if (finished) return;
     finished = true;
     if (raf) cancelAnimationFrame(raf);
-    canvas.remove();
+    if (glCache) releaseGLCanvas(glCache);
+    else canvas?.remove();
     onDone?.();
   };
 
   // 直接用已加载的 DOM <img> 同步生成纹理（不重新 new Image 加载，避免异步闪烁）。
   const tex = document.createElement("canvas");
-  // 纹理倍率：小卡片保留 TEX_SCALE(2×)，大卡片(全屏)按长边封顶 MAX_TEX_EDGE 自动降倍率，
-  // 避免数千像素见方的超大纹理上传造成 GPU 首帧尖峰。GL 的 uv 为归一化(0~1)、2D 回退按 tw/th 取值，降尺寸对两渲染器均安全。
-  const texScale = Math.min(TEX_SCALE, MAX_TEX_EDGE / Math.max(cardW, cardH));
+  // 纹理倍率 = 吸入画布的有效 dpr（形变后最大显示尺寸 = 初始卡片 × dpr，再高 GPU 只会下采样→纯浪费上传字节）。
+  // 按 dpr(≤MAX_DPR) 封顶纹理分辨率，相比原固定 2× 更省上传且相对画布后备分辨率逐像素无损；大图再受 MAX_TEX_EDGE 二次封顶。
+  const texScale = Math.min(dpr, MAX_TEX_EDGE / Math.max(cardW, cardH));
   tex.width = Math.max(1, Math.round(cardW * texScale));
   tex.height = Math.max(1, Math.round(cardH * texScale));
   const tctx = tex.getContext("2d");
@@ -333,6 +395,36 @@ export function playSuction(opts: SuctionOptions): void {
   } catch {
     texTainted = true;
   }
+
+  // ===== 获取展示层后端：不污染 → 复用池中 WebGL 上下文（消除上下文创建 churn）；污染/池禁用 → 临时画布 =====
+  const usePool = poolOverlay !== undefined ? poolOverlay : suctionPoolEnabled;
+  if (!texTainted) glCache = acquireGLCanvas(usePool);
+  if (glCache) {
+    canvas = glCache.canvas;
+  } else {
+    canvas = document.createElement("canvas");
+    canvas.style.pointerEvents = "none";
+  }
+  canvas.width = Math.floor(boxW * dpr);
+  canvas.height = Math.floor(boxH * dpr);
+  // 定位：有 container → absolute 挂容器，元素左上 = 视口(minX,minY) 换算为容器内，z-index:-1 落在卡片之下（新入图不被遮挡）；
+  //        无 container → fixed 挂 body（原行为，最大 z）。
+  if (container) {
+    const cRect = container.getBoundingClientRect();
+    canvas.style.position = "absolute";
+    canvas.style.left = minX - cRect.left + "px";
+    canvas.style.top = minY - cRect.top + "px";
+    canvas.style.zIndex = "-1";
+  } else {
+    canvas.style.position = "fixed";
+    canvas.style.left = minX + "px";
+    canvas.style.top = minY + "px";
+    canvas.style.zIndex = "2147483646";
+  }
+  canvas.style.width = boxW + "px";
+  canvas.style.height = boxH + "px";
+  canvas.style.pointerEvents = "none";
+  (container ?? document.body).appendChild(canvas);
 
   const rows = Math.max(3, Math.min(MAX_GRID, Math.round(cols * (cardH / cardW))));
 
@@ -431,28 +523,15 @@ export function playSuction(opts: SuctionOptions): void {
     return 1 - (0.55 + 0.45 * k);
   };
 
-  // ===== 选择渲染器：WebGL 优先，失败回退 Canvas2D =====
-  // 注意：纹理被污染时必须在此处（首次 getContext）就跳过申请 WebGL 上下文——
-  // 同一 canvas 一旦先取得 webgl 上下文，后续 getContext("2d") 将返回 null，回退渲染器会失效。
+  // ===== 选择渲染器：WebGL 优先（复用池中已存在的上下文，不再 getContext 新建），否则回退 Canvas2D =====
   let glRender: ((vertices: Vert[][], dark: number) => void) | null = null;
-  const gl =
-    (!texTainted &&
-      canvas.getContext("webgl", {
-        alpha: true,
-        premultipliedAlpha: true,
-        antialias: false,
-        depth: false,
-        stencil: false,
-        preserveDrawingBuffer: false,
-      })) ||
-    null;
-  if (gl) glRender = createSuctionGL(gl, tex, boxW, boxH, cols, rows, minX, minY);
+  if (glCache) glRender = setupGLRender(glCache, tex, boxW, boxH, cols, rows, minX, minY);
 
   // ---- Canvas2D 回退（逐三角贴图）：仅在 WebGL 不可用时启用 ----
   let ctx: CanvasRenderingContext2D | null = null;
   let drawCardMesh2D: ((progress: number) => void) | null = null;
   if (!glRender) {
-    ctx = canvas.getContext("2d");
+    ctx = canvas!.getContext("2d");
     if (!ctx) {
       finish();
       return;
