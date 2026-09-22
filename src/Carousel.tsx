@@ -1546,10 +1546,12 @@ function SwiperLoopCarousel({
         // 先让 Swiper 开始动画，再更新 React 状态
         // 避免 React re-render 期间 Swiper 内部状态被重置导致动画丢失
         if (swiper.realIndex !== idx) {
+          // 显式传 speed：本实例 params.speed 可能被（viewMode 冻结等路径）置为 0 且未能恢复，
+          // 不传则 slideTo 用 params.speed=0 → 瞬移。实测显式传 400 即恢复平滑滑动。
           if (swiper.params.loop) {
-            swiper.slideToLoop(idx);
+            swiper.slideToLoop(idx, 400);
           } else {
-            swiper.slideTo(idx);
+            swiper.slideTo(idx, 400);
           }
           // 实际发生了滑动才标记跳转目标（抑制中间 slideChange）
           jumpTargetRef.current = idx;

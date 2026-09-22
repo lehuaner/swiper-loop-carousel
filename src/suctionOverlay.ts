@@ -35,7 +35,10 @@ export interface SuctionOptions {
   container?: HTMLElement;
 }
 
-const TEX_SCALE = 2; // 纹理分辨率 = 卡片显示尺寸 × 2（清晰且对视网膜屏友好）
+const TEX_SCALE = 2; // 纹理分辨率 = 卡片显示尺寸 × 2（但受 MAX_TEX_EDGE 上限约束）
+// ===== 性能护栏（75Hz/高刷屏下保吸入满帧：削 GPU 每帧合成与首帧上传成本，0.4s 形变观感无损）=====
+const MAX_DPR = 1.5; // 吸入 canvas backing store 的 dpr 上限（形变动画无需满 dpr；backing 面积随 dpr² 降）
+const MAX_TEX_EDGE = 1600; // 吸入纹理长边像素上限（texImage2D 上传量封顶；小图仍保留 2×，大图自动降倍率）
 const MAX_GRID = 20; // 需求约束：网格密度不超过 20
 const FRONT = 0.45; // 版本1：形变前沿蔓延速度（远处顶点需等波前到达才开始动）
 const TINY = 0.05; // 顶点收束到目标附近的比例
@@ -213,8 +216,15 @@ export function playSuction(opts: SuctionOptions): void {
     onDone?.();
     return;
   }
-  // 卡片 clamp 到"框定区域"（crop）：被删图被缩放/拖拽到超边界时，形变卡片限制在可见区内，
-  // 删除动画不突破拖拽边界。目标点若在 crop 外（按钮在边界外），也 clamp 到 crop 内。
+  // 图片在卡片框内的完整矩形（object-cover 后的真实可见图框），作为裁切映射的基准帧
+  const frameX0 = cardX;
+  const frameY0 = cardY;
+  const frameW = cardW;
+  const frameH = cardH;
+  // 超出"拖拽/可见区域(crop)"的部分：直接裁掉，只用区域内的子图吸入（裁切，不压缩）。
+  // cropOffX/Y = 可见子区相对整帧的左上偏移，用于反算原图源矩形。
+  let cropOffX = 0;
+  let cropOffY = 0;
   if (crop) {
     const cx0 = crop.x, cy0 = crop.y, cx1 = crop.x + crop.w, cy1 = crop.y + crop.h;
     const ic0x = Math.max(cardX, cx0), ic0y = Math.max(cardY, cy0);
@@ -225,11 +235,13 @@ export function playSuction(opts: SuctionOptions): void {
       return;
     }
     cardX = ic0x; cardY = ic0y; cardW = ic1x - ic0x; cardH = ic1y - ic0y;
+    cropOffX = cardX - frameX0;
+    cropOffY = cardY - frameY0;
     targetCenter.x = Math.max(cx0, Math.min(cx1, targetCenter.x));
     targetCenter.y = Math.max(cy0, Math.min(cy1, targetCenter.y));
   }
 
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
 
   // 画布只覆盖"卡片矩形 + 吸入目标点"的包围盒，而非整屏。
   // 全屏 canvas 在高分屏（如 4K@2dpr = 7680×4320）会同步分配上百 MB 的 backing store，
@@ -278,8 +290,11 @@ export function playSuction(opts: SuctionOptions): void {
 
   // 直接用已加载的 DOM <img> 同步生成纹理（不重新 new Image 加载，避免异步闪烁）。
   const tex = document.createElement("canvas");
-  tex.width = Math.max(1, Math.round(cardW * TEX_SCALE));
-  tex.height = Math.max(1, Math.round(cardH * TEX_SCALE));
+  // 纹理倍率：小卡片保留 TEX_SCALE(2×)，大卡片(全屏)按长边封顶 MAX_TEX_EDGE 自动降倍率，
+  // 避免数千像素见方的超大纹理上传造成 GPU 首帧尖峰。GL 的 uv 为归一化(0~1)、2D 回退按 tw/th 取值，降尺寸对两渲染器均安全。
+  const texScale = Math.min(TEX_SCALE, MAX_TEX_EDGE / Math.max(cardW, cardH));
+  tex.width = Math.max(1, Math.round(cardW * texScale));
+  tex.height = Math.max(1, Math.round(cardH * texScale));
   const tctx = tex.getContext("2d");
   if (!tctx) {
     finish();
@@ -287,12 +302,26 @@ export function playSuction(opts: SuctionOptions): void {
   }
   const tw = tex.width;
   const th = tex.height;
-  const siw = iw || cardW;
-  const sih = ih || cardH;
-  const cover = Math.max(tw / siw, th / sih); // cover 填充：保持原图比例、铺满整张卡片
-  const dw = siw * cover;
-  const dh = sih * cover;
-  tctx.drawImage(imgEl, (tw - dw) / 2, (th - dh) / 2, dw, dh);
+  if (iw && ih) {
+    // 裁切（非压缩）：按整帧 object-cover 映射，取"可见子区"对应原图的源矩形，只把仍可见的那部分画进纹理。
+    // → 保持图片比例（裁掉界外，不重填缩放）；纹理尺寸=可见区（更小，降首帧上传）。
+    const coverF = Math.max(frameW / iw, frameH / ih);
+    const imgDX = (frameW - iw * coverF) / 2; // cover 下 ≤0
+    const imgDY = (frameH - ih * coverF) / 2;
+    let sxs = (cropOffX - imgDX) / coverF;
+    let sys = (cropOffY - imgDY) / coverF;
+    sxs = Math.max(0, Math.min(iw, sxs));
+    sys = Math.max(0, Math.min(ih, sys));
+    const swd = Math.max(1, Math.min(iw - sxs, cardW / coverF));
+    const shd = Math.max(1, Math.min(ih - sys, cardH / coverF));
+    tctx.drawImage(imgEl, sxs, sys, swd, shd, 0, 0, tw, th);
+  } else {
+    // 无自然尺寸（异常）：回退整图 cover 填充
+    const cover = Math.max(tw / cardW, th / cardH);
+    const dw = cardW * cover;
+    const dh = cardH * cover;
+    tctx.drawImage(imgEl, (tw - dw) / 2, (th - dh) / 2, dw, dh);
+  }
 
   // 污染检测：跨域且未带 CORS 许可的图片被 drawImage 进纹理 canvas 后，canvas 即被"污染"(tainted)。
   // WebGL 的 texImage2D 需要从 canvas 读取像素，对污染 canvas 会直接抛 SecurityError；

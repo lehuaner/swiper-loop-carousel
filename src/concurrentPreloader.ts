@@ -128,6 +128,9 @@ export class ConcurrentPreloader {
   private usedIdx = new Set<number>();
   private cacheOrder: string[] = [];
   private knownIdx = new Map<number, string>();
+  // ② 当前在屏（可见/中心附近）的 url 集：reclaimForFront 绝不中断这些在途下载，
+  //    防止删除/切图时的优先级抖动把“正在显示的加载图”误杀重启。
+  private protectedUrls = new Set<string>();
   private paused = false;
   private loadTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingIdx: number | null = null;
@@ -139,6 +142,20 @@ export class ConcurrentPreloader {
     // 导致 getSrc(idx) 按 knownIdx 返回已删除图的 blob，渲染出"删除位残留旧图"。
     // 索引映射一律以最新的 urls 为准，故清空 knownIdx 让它回落到 urls[idx]。
     this.knownIdx.clear();
+    // ① 删除/重排使 urls 左移后，queue 里各任务的 idx 是入队时捕获的旧下标，会漂移，
+    //    使 priorityOf 误判 → 在屏幸存图的下载被当作低优先中断重启。这里把每个任务的 idx
+    //    重新对齐到其 url 在新 urls 中的真实下标；url 已被删除的任务中断并剔除（槽位由 runDownload finally 释放）。
+    const kept: typeof this.queue = [];
+    for (const q of this.queue) {
+      const ni = this.urls.indexOf(q.url);
+      if (ni < 0) {
+        q.controller?.abort();
+        continue;
+      }
+      q.idx = ni;
+      kept.push(q);
+    }
+    this.queue = kept;
   }
 
   configure(options: PreloadOptions) {
@@ -234,6 +251,11 @@ export class ConcurrentPreloader {
    *  可见原图也会被预载（preloadRange 较小时 commitLoad 只覆盖中心，导致它们停在缩略图）。 */
   commitActive(centerIdx: number, visible: number[]) {
     this.setCenter(centerIdx);
+    // ② 本次可见集（含中心）的 url 列为保护集，其下载不得被 reclaimForFront 中断。
+    const prot = new Set<string>();
+    for (const i of visible) { const u = this.urls[i]; if (u) prot.add(u); }
+    const cu = this.urls[centerIdx]; if (cu) prot.add(cu);
+    this.protectedUrls = prot;
     const [a, b] = normalizeRange(this.opts.preloadRange);
     const targets = new Set<number>();
     for (let off = a; off <= b; off++) {
@@ -272,6 +294,10 @@ export class ConcurrentPreloader {
   commitLoad(idx: number) {
     this.setCenter(idx);
     const [a, b] = normalizeRange(this.opts.preloadRange);
+    // ② 中心及其预加载范围内的 url 列为保护集，不得被中断重启。
+    const prot = new Set<string>();
+    for (let off = a; off <= b; off++) { const u = this.urls[idx + off]; if (u) prot.add(u); }
+    this.protectedUrls = prot;
     const indices: number[] = [];
     for (let off = a; off <= b; off++) {
       const t = idx + off;
@@ -307,7 +333,7 @@ export class ConcurrentPreloader {
     const topPrio = this.priorityOf(top.idx);
     // 按当前中心图重算各在途任务的优先级，挑出比 top 更无关的，最无关的优先暂停
     const toAbort = this.queue
-      .filter((q) => q.state === "downloading" && this.priorityOf(q.idx) > topPrio)
+      .filter((q) => q.state === "downloading" && this.priorityOf(q.idx) > topPrio && !this.protectedUrls.has(q.url))
       .sort((a, b) => this.priorityOf(b.idx) - this.priorityOf(a.idx));
     for (const t of toAbort) t.controller?.abort();
   }
