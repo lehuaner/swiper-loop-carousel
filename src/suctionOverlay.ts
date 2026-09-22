@@ -7,7 +7,7 @@
 //   - 网格密度 cols 受 MAX_GRID(20) 约束；行数按图片宽高比推算（最终也 ≤ 20 量级）。
 //   - 真实 DOM 删除按钮已存在，因此不绘制示例里的垃圾桶本体，仅保留图片被吸入的形变。
 // 渲染：优先 WebGL（GPU 一次 drawArrays 完成网格纹理映射 + 变暗），WebGL 不可用时回退 Canvas2D 逐三角贴图。
-//   两渲染器读取同一份形变顶点、同一张纹理，输出逐像素一致；形变算法为"版本1：波前蔓延"。
+//   两渲染器读取同一份形变顶点、同一张纹理，输出逐像素一致；形变算法为“版本六：波前吸入 + 整卡退槽刚体变换同时”。
 
 export interface SuctionTarget {
   x: number; // 视口坐标
@@ -40,9 +40,26 @@ const MAX_GRID = 20; // 需求约束：网格密度不超过 20
 const FRONT = 0.45; // 版本1：形变前沿蔓延速度（远处顶点需等波前到达才开始动）
 const TINY = 0.05; // 顶点收束到目标附近的比例
 const FLAT = 0.55; // 纵向压扁
+// ===== 版本六“退槽”刚体变换（移植自 examples suction-core.js _v6Motion）=====
+// 在版本一波前吸入的同时，对整卡叠加：缩小到 (1-SHRINK·e) + 沿“卡片中心→删除按钮”位移 DIST·e，
+// e = 退槽曲线 bezierEase(progress)，无旋转。
+const RETRACT_CURVE = [0.33, 1, 0.68, 1]; // 退槽曲线 cubic-bezier（默认 easeOutCubic）
+const RETRACT_SHRINK = 0.38; // 缩小到原图的 62%
+const RETRACT_DIST_RATIO = 0.12; // 朝删除按钮位移距离 = 卡片短边 × 该比例
 
 function easeInOut(t: number): number {
   return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+}
+
+// cubic-bezier 缓动求值（退槽曲线）：二分解 Bx(u)=x 取 By(u)；y 可越界（过冲/回拉）。移植自 examples。
+function bezierEase(x: number, c: number[]): number {
+  if (x <= 0) return 0;
+  if (x >= 1) return 1;
+  const bx = (u: number) => 3 * u * (1 - u) * (1 - u) * c[0] + 3 * u * u * (1 - u) * c[2] + u * u * u;
+  const by = (u: number) => 3 * u * (1 - u) * (1 - u) * c[1] + 3 * u * u * (1 - u) * c[3] + u * u * u;
+  let lo = 0, hi = 1, u = 0.5;
+  for (let i = 0; i < 24; i++) { u = (lo + hi) * 0.5; if (bx(u) < x) lo = u; else hi = u; }
+  return by((lo + hi) * 0.5);
 }
 
 type Vert = { x: number; y: number };
@@ -336,12 +353,24 @@ export function playSuction(opts: SuctionOptions): void {
   };
   pickStartCorner();
 
-  // 核心形变（版本1：波前蔓延）：形变前沿沿对角线从起始角扫过整图，
-  // 远处顶点要等波前到达才开始飞向目标（"排队启动"），近处先动。
+  // 核心形变（版本六：波前吸入 + 整卡“退槽”刚体变换同时播放）。
+  // 每帧先对整卡施加 缩小到(1-SHRINK·e) + 朝删除按钮位移 DIST·e（e=退槽曲线 bezierEase(progress)），
+  // 再在此“退槽后”的刚体位置上，按版本一波前公式把各顶点收拢到删除按钮口。
+  const retractDist = Math.min(card.w, card.h) * RETRACT_DIST_RATIO;
   const updateVertices = (progress: number) => {
     const tx = targetCenter.x;
     const ty = targetCenter.y;
     const TC = card.center;
+    // 退槽刚体量（方向：卡片中心 → 删除按钮）
+    const e = bezierEase(progress, RETRACT_CURVE);
+    let ux = tx - TC.x;
+    let uy = ty - TC.y;
+    const D = Math.hypot(ux, uy) || 1;
+    ux /= D;
+    uy /= D;
+    const rox = ux * retractDist * e;
+    const roy = uy * retractDist * e;
+    const rs = 1 - RETRACT_SHRINK * e;
     for (let r = 0; r <= rows; r++) {
       const fdRow = card.frontDist[r];
       const vRow = card.vertices[r];
@@ -352,11 +381,17 @@ export function playSuction(opts: SuctionOptions): void {
         let lp = (progress - d * (1 - FRONT)) / FRONT; // 波前扫过：远处需等波前到达
         lp = lp < 0 ? 0 : lp > 1 ? 1 : lp;
         lp = easeInOut(lp);
-        const nx = tx + (o.x - TC.x) * TINY;
-        const ny = ty + (o.y - TC.y) * TINY * FLAT;
+        const rx = o.x - TC.x;
+        const ry = o.y - TC.y;
+        // 退槽后的刚体位置（整卡缩小+朝钮位移）
+        const mx = TC.x + rx * rs + rox;
+        const my = TC.y + ry * rs + roy;
+        // 吸入目标：删除按钮口（绝对系，与版本一一致）
+        const gx = tx + rx * TINY;
+        const gy = ty + ry * TINY * FLAT;
         const v = vRow[c];
-        v.x = o.x + (nx - o.x) * lp;
-        v.y = o.y + (ny - o.y) * lp;
+        v.x = mx + (gx - mx) * lp;
+        v.y = my + (gy - my) * lp;
       }
     }
   };
