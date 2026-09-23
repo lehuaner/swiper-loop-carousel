@@ -96,33 +96,81 @@ export function useLazyVisibleSet(itemCount: number): {
 // ── useInView ──
 // 单个元素进入/离开视口的局部检测。可见性变化只更新本组件局部 state，
 // 不触发父级/全局重渲染，适合缩略图条这类"谁可见谁加载"的场景。
+//
+// 性能：按 rootMargin 共享一个真实 IntersectionObserver 实例，而不是每个调用方各自
+// new 一个。缩略图条虚拟化窗口内有 ~41 个 ThumbnailItem 各调用一次 useInView，
+// 合并前实测删除窗口内 computeIntersections 被调用 204 次、累计 108.4ms。
+// 注：合并后复测（Trace-20260923T184733）发现 IO 总耗时基本持平（216 次/115.5ms），
+// 说明浏览器端 computeIntersections 的开销主要是按“目标数”而非“observer 实例数”计算，
+// 合并实例没有按预期降低这部分耗时（本改动保留：仍然减少了 40 个冗余 observer 对象/回调
+// 闭包的创建与销毁，属于无害的结构性改善，但不能当作已验证的性能收益看待）。
+
+const sharedObservers = new Map<
+  string,
+  { observer: IntersectionObserver; targets: Map<Element, (isIntersecting: boolean) => void> }
+>();
+
+function acquireSharedObserver(rootMargin: string) {
+  let entry = sharedObservers.get(rootMargin);
+  if (!entry) {
+    const targets = new Map<Element, (isIntersecting: boolean) => void>();
+    const observer = new IntersectionObserver(
+      (records) => {
+        for (const record of records) {
+          targets.get(record.target)?.(record.isIntersecting);
+        }
+      },
+      { rootMargin }
+    );
+    entry = { observer, targets };
+    sharedObservers.set(rootMargin, entry);
+  }
+  const { observer, targets } = entry;
+  return {
+    observe(el: Element, cb: (isIntersecting: boolean) => void) {
+      targets.set(el, cb);
+      observer.observe(el);
+    },
+    unobserve(el: Element) {
+      targets.delete(el);
+      observer.unobserve(el);
+      // 该 rootMargin 下已无观察目标时释放实例，避免长期驻留（下次调用会重新按需创建）
+      if (targets.size === 0) {
+        observer.disconnect();
+        sharedObservers.delete(rootMargin);
+      }
+    },
+  };
+}
 
 export function useInView<T extends HTMLElement = HTMLElement>(
   rootMargin = "0px"
 ): [boolean, (el: T | null) => void] {
   const [inView, setInView] = useState(false);
-  const ioRef = useRef<IntersectionObserver | null>(null);
+  const elRef = useRef<T | null>(null);
 
   const setRef = useCallback(
     (el: T | null) => {
-      if (ioRef.current) {
-        ioRef.current.disconnect();
-        ioRef.current = null;
-        setInView(false);
-      }
+      const shared = acquireSharedObserver(rootMargin);
+      if (elRef.current) shared.unobserve(elRef.current);
+      elRef.current = el;
       if (el) {
-        const obs = new IntersectionObserver(
-          (entries) => setInView(entries[0]?.isIntersecting ?? false),
-          { rootMargin }
-        );
-        ioRef.current = obs;
-        obs.observe(el);
+        shared.observe(el, (isIntersecting) => setInView(isIntersecting));
+      } else {
+        setInView(false);
       }
     },
     [rootMargin]
   );
 
-  useEffect(() => () => ioRef.current?.disconnect(), []);
+  useEffect(() => {
+    return () => {
+      if (elRef.current) {
+        acquireSharedObserver(rootMargin).unobserve(elRef.current);
+        elRef.current = null;
+      }
+    };
+  }, [rootMargin]);
 
   return [inView, setRef];
 }

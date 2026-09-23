@@ -2948,6 +2948,17 @@ function SwiperLoopCarousel({
   }, [isOpen, images.length]);
 
   // 创建单个 slide 的内容（提取为函数，Virtual 和非 Virtual 模式共用）
+  //
+  // 性能：`slides` / `renderVirtualOverlaySlide` 两个 useMemo 只覆盖 nearActiveSet（约 11 张），
+  // 但 `renderSlideInner` 本身有 35 项依赖，任一依赖变化都会让这 11 张全部重建 JSX。
+  // 这里加一层按 `index + img.id` 分片的元素缓存：把该 slide 本次计算用到的全部输入值
+  // 收进一个签名单元组，与上次命中缓存时保存的签名逐项 Object.is 比较，完全一致则直接复用
+  // 上一次构造好的 `node`（React 对同一 element 引用会 bail out，跳过该子树 reconcile）。
+  // 只统计"渲染期读取到的值"，不改动任何视觉判断逻辑本身，因此命中/未命中的计算结果与原
+  // 实现逐字节一致；未命中（如发生删除重排，多数派生值本就会变）时按原路径重新构造 node。
+  const slideElementCacheRef = useRef<
+    Map<string, { sig: unknown[]; node: React.ReactElement; slideClassName: string; overflowClip: boolean }>
+  >(new Map());
   const renderSlideInner = useCallback((index: number) => {
     const img = images[index];
     // 全部删除后 overlay 关闭前的一瞬 n 可能为 0，或 %0 使 nearActiveSet 产生 NaN/Fractional 下标：
@@ -3222,6 +3233,41 @@ function SwiperLoopCarousel({
     // 单图模式下可见滑片即 realIndex，imgOverflowActive 恰反映它，故可直接使用。
     const overflowClip = viewMode === 1 && !isTransitioningViewMode && !imgOverflowActive && !deleteEntryTarget;
     const slideClassName = `!flex h-full min-h-0 items-center justify-center${overflowClip ? " !overflow-hidden" : ""}`;
+    // ── 按 slide 分片的元素缓存：把本次用到的全部输入值收进一个签名单元组 ──
+    const cacheKey = `${index}-${img.id}`;
+    const sig: unknown[] = [
+      // 与"这张图本身"相关的输入
+      img.id, img.thumbSrc, img.src, img.alt, img.dimensions, img.width, img.height, img.sizeLabel, img.fileSize,
+      renamedMapRef.current.get(img.id) ?? img.alt,
+      // 由 preloader / 加载态派生
+      readySrc, displaySrc, thumbReady, showSpinner, progressKnown, downloadProgress,
+      // 视图模式切换 / 缩放补偿相关
+      relIdx, prevVM, newVM, entryXFrom, entryScaleFrom, isExitingOnViewModeChange, viewModeZIndex,
+      // 活跃/行列归属 / 隐藏判定
+      isActive, wasActiveMap.get(index), deletedInActiveRow, groupShiftOn, rider, deleteShiftActive,
+      deleteFillTarget, fillSettledAt, deleteSurvivorFillTarget, survivorSettledAt,
+      deleteEntryTarget, entryNoFade, imgOverflowing, isFirstInRow, isLastInRow, inRow,
+      horizontalClip, movingClipPath, neighborHidden, overflowClip, slideClassName, deleteTranslateX,
+      // 直接透传给子组件的 motion / ref（对象身份，非读取 .get()，MotionValue 本身稳定则不触发失效）
+      motionsNow, groupShiftX,
+      // 闭包内直接捕获进 JSX 的组件级 state/props/ref（身份变化必须使缓存失效）
+      n, realIndex, containerWidth, containerHeight, isTransitioningViewMode, isSwipeAnimating, isPinching,
+      viewModeEpoch, slideDirectionRef, activeIndices.size, preloader.version,
+      deletingId, deletingReshapedRef.current, deleteMotionStarted, serialAnim,
+      lastDeletedIndexRef.current, imgDraggingIdx, imgOverflowActive,
+      // 内联进 JSX 作为闭包引用的函数/数组（onExitComplete/onDragStart/onDownload/onClick 等捕获了本次渲染的
+      // 这些引用，若不复位为最新值，命中缓存时会调用到旧闭包）
+      renderOverlay, onDownload, actionsConfig, flyOutAndRemove, startRename, onThumbLoaded,
+      renameSeq, devHideMainImage, devDisableSurvivorAnim, totalCount,
+    ];
+    const cached = slideElementCacheRef.current.get(cacheKey);
+    if (
+      cached &&
+      cached.sig.length === sig.length &&
+      cached.sig.every((v, i) => Object.is(v, sig[i]))
+    ) {
+      return { node: cached.node, slideClassName: cached.slideClassName, overflowClip: cached.overflowClip };
+    }
     const node: React.ReactElement = (
         <div
           data-img-index={index}
@@ -3404,6 +3450,10 @@ function SwiperLoopCarousel({
           )}
         </div>
     );
+    // 写入缓存；cache 以 index+img.id 为键，连续翻页/大量重排时 key 会随窗口移动不断新增，
+    // 超过阈值直接清空（nearActiveSet 窗口很小，少量重建不构成实际开销，仅防止长期驻留）。
+    if (slideElementCacheRef.current.size > 64) slideElementCacheRef.current.clear();
+    slideElementCacheRef.current.set(cacheKey, { sig, node, slideClassName, overflowClip });
     return { node, slideClassName, overflowClip };
   }, [images, realIndex, n, prevViewMode, viewMode, isTransitioningViewMode, isSwipeAnimating, containerWidth, containerHeight, preloader, preloader.version, isPinching, activeIndices, wasActiveMap, viewModeEpoch, slideDirectionRef, getOrCreateImageMotions, renderOverlay, onDownload, imgDraggingIdx, imgOverflowActive, actionsConfig, flyOutAndRemove, startRename, deletingId, renamedMapRef, renameSeq, deletingReshapedRef, onThumbLoaded, devHideMainImage, devDisableSurvivorAnim, deleteMotionStarted, serialAnim]);
 
