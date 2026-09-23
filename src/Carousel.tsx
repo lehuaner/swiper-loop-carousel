@@ -682,9 +682,16 @@ function SwiperLoopCarousel({
   // 若不合并，残留的多套 500ms 定时器会在最后一张图已静置稳定后异步晚触发——再次
   // updateSlides/slideTo 拨动 Swiper 触发 slideChange，导致已到位的图被重新判为新图。
   const settleResetTimerRef = useRef<number | null>(null);
+  // 删除窗口过期后的"主动清算"定时器：pruneDeleteFillState 原本只在"下一次删除开始"时才被调用，
+  // 导致"删除一张后不再删除"时 lastDeletedIndexRef 永不复位——占用被删下标的新图会在后续普通
+  // 切换中被 neighborHidden 的 `lastDeletedIndexRef.current !== index` 前置永久短路放行而保持可见。
+  // 这里在最后一次静置时刻 + DELETE_FILL_VALID_MS 之后主动 prune 一次（与"下次删除时清算"完全
+  // 同一幂等效果，纯复位 ref、不触发重放、无竞争），复位 lastDeletedIndexRef / deletingReshapedRef。
+  const deletePruneTimerRef = useRef<number | null>(null);
   useEffect(() => {
     return () => {
       if (settleResetTimerRef.current != null) window.clearTimeout(settleResetTimerRef.current);
+      if (deletePruneTimerRef.current != null) window.clearTimeout(deletePruneTimerRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1287,6 +1294,16 @@ function SwiperLoopCarousel({
         for (const id of relocateSurvivorFillIdsRef.current.keys()) {
           relocateSurvivorFillIdsRef.current.set(id, settleNow);
         }
+        // 安排"窗口过期后主动清算"：若此后没有新一轮删除刷新静置时刻并重置本定时器，则在最后一个
+        // 删除静置窗口自然过期后调一次 pruneDeleteFillState，复位 lastDeletedIndexRef / deletingReshapedRef，
+        // 杜绝被删下标在后续普通切换中被 neighborHidden 永久误放行可见。有后续删除时本定时器被重排到
+        // 更晚，最终只在真正静置满 DELETE_FILL_VALID_MS 后触发一次；prune 按时间戳惰性过期，与"下次删除
+        // 开始时清算"完全同一效果，不会提前清掉未过期项、不会重放入场动画。
+        if (deletePruneTimerRef.current != null) window.clearTimeout(deletePruneTimerRef.current);
+        deletePruneTimerRef.current = window.setTimeout(() => {
+          deletePruneTimerRef.current = null;
+          pruneDeleteFillState();
+        }, DELETE_FILL_VALID_MS + 120) as unknown as number;
         // incoming（双图/三图）的"重排后静置抑制二次入场"在此刻才生效：
         // 删除窗口内它是 rider+deleteEntryTarget，已播与切换同源的入场，不能静置；
         // 重排提交后它已落位，加入静置集合（此刻刷新为 settleNow），杜绝"落位后 isActive 闪断
@@ -2880,6 +2897,36 @@ function SwiperLoopCarousel({
     return s;
   }, [isOpen, realIndex, viewMode, n]);
 
+  // ── 邻图“落位后闪现上一张”修复（根因B：收口延迟） ──
+  // 实测：上一张（leaving card）在 400ms 飞出动画全程可见（正常），但停住后它的 18px 左边缘
+  // 残影要多停留 ~16ms（1~2 帧）才消失——因为它的隐藏依赖 isSwipeAnimating=false 触发的那次
+  // 全量重渲染提交，提交天然慢一帧以上。元素缓存已把它从 ~47ms 压到 ~16ms，但压不到 0。
+  // 修法：落位瞬间（transitionEnd）对“刚飞出的那一张”命令式立即写 visibility:hidden，抢在慢提交
+  // 之前抹掉残影。之所以这次不会重踏“永久卡死”：已让 innerDivStyle 对近活跃 slide 始终显式
+  // 写 visibility（见 renderSlideInner），React 完全接管了这个键——命令式写的值会在下一次 React
+  // 渲染时被正确值覆盖（该卡变回活跃时 React 会显式写 visible），命令式永远只是“提前量”，不可能残留。
+  const slideElMapRef = useRef<Map<number, HTMLElement>>(new Map());
+  // 用 ref 镜像判断所需的最新值，避免 handleSlideChangeTransitionEnd 被 Swiper 内部缓存为旧引用
+  // 时读到过期闭包（transitionEnd 是渲染提交之后的延迟事件，useEffect 同步不影响正确性）。
+  const neighborHideContextRef = useRef({ realIndex, n, viewMode, activeIndices, deletingId, isTransitioningViewMode });
+  useEffect(() => {
+    neighborHideContextRef.current = { realIndex, n, viewMode, activeIndices, deletingId, isTransitioningViewMode };
+  }, [realIndex, n, viewMode, activeIndices, deletingId, isTransitioningViewMode]);
+  const handleSlideChangeTransitionEnd = useCallback(() => {
+    const { realIndex: ri, n: nn, viewMode: vm, activeIndices: ai, deletingId: del, isTransitioningViewMode: transitioning } = neighborHideContextRef.current;
+    // 仅在“普通切换落位”且 nn>0 时命令式收口；删除/视图切换有自己的可见性规则，不插手。
+    if (del == null && !transitioning && nn > 0) {
+      // 与 isLeavingCard 同一公式算出“刚飞出的那一张”的下标：dir=1→(ri+n-1)%nn、dir=-1→(ri+vm)%nn。
+      const leavingRelIdx = slideDirectionRef.current === -1 ? vm : nn - 1;
+      const leavingIdx = (((ri + leavingRelIdx) % nn) + nn) % nn;
+      if (!ai.has(leavingIdx)) {
+        const el = slideElMapRef.current.get(leavingIdx);
+        if (el && el.isConnected) el.style.visibility = "hidden";
+      }
+    }
+    setIsSwipeAnimating(false);
+  }, []);
+
   // 预计算 Swiper 渲染范围内的 idx 集合（active ± SWIPER_RENDER_RANGE），避免 map 内 440 次取模
   // 退出动画期间保留缓存
   const SWIPER_RENDER_RANGE = 5;
@@ -3200,16 +3247,31 @@ function SwiperLoopCarousel({
     // 例外四：删除窗口内"从右侧进入新末位的下一张图"（deleteEntryTarget）非活跃却要播放与切换
     //        相同的"缩放+淡入+飞入"，若被此处隐藏，其飞入全程不可见，重排后静置归位则表现为
     //        新图"直接出现"而非飞入。故删除期间放行它，保证飞入可见。
+    // 例外三（收窄版）：普通滑动过渡中（isSwipeAnimating）过去会放行整个 nearActiveSet（realIndex±5）
+    // 的非活跃邻图，导致"落位前后活跃行两侧的远邻各闪现一下又消失"（实测 ~50ms 收口延迟期可见）。
+    // 这里改为：动画期间只放行"正在飞出视口的那一张"（leaving card），其余远邻始终隐藏。
+    // relIdx 以新 realIndex 为基准（goToIndex 已同步提交 realIndex）：
+    //   - dir=1（向后翻，正序）：飞出视口左缘的是 realIndex-1，其 relIdx = n-1；
+    //   - dir=-1（向前翻）：飞出视口右缘的是 realIndex+viewMode，其 relIdx = viewMode。
+    // 全部走 innerDivStyle 声明式控制 visibility，不做命令式 style 覆盖（避免 React 不管理该键时
+    // 内联样式无法被回收、卡片永久卡死的历史问题）。
+    const leavingRelIdx = slideDirectionRef.current === -1 ? viewMode : n - 1;
+    const isLeavingCard =
+      isSwipeAnimating && !isTransitioningViewMode && relIdx === leavingRelIdx;
+    // 例外一（收紧）：被删图在飞出动画期间（重排提交前，deletingReshapedRef=false）即使已非
+    // 活跃也保持可见。但豁免必须限定在"重排提交前"：重排后该下标已换为另一张幸存图（被删图已从
+    // 数组移除），若仍按 lastDeletedIndexRef===index 豁免，会让占用该下标的图在后续普通切换中
+    // 永久保持可见（而 lastDeletedIndexRef 只在下次删除/prune 时复位）。故加上 deletingReshapedRef
+    // 门控：重排提交后豁免立即失效，零延迟、纯声明式。
     const neighborHidden =
       !isActive &&
-      lastDeletedIndexRef.current !== index &&
+      !isLeavingCard &&
+      (lastDeletedIndexRef.current !== index || deletingReshapedRef.current) &&
       !deleteEntryTarget &&
       (
-        // 缩放/拖拽溢出时隐藏非活跃邻图（防其从半透明框架漏出）。但在视图切换过渡中
-        // 必须放行"正在退出/进入"的邻图——否则被放大图的存在（imgOverflowActive=true）
-        // 会在过渡一开始就把第二张等邻图瞬间隐藏，导致它们"直接消失、无退出动画"。
-        (!isTransitioningViewMode && !isSwipeAnimating && imgOverflowActive) ||
-        (!isTransitioningViewMode && !isSwipeAnimating) ||
+        // 非视图切换（含普通滑动动画与空闲）：非活跃邻图一律隐藏。动画期间唯一被豁免的是
+        // leaving card（上面 !isLeavingCard 已拦截），其余远邻不再闪现。
+        !isTransitioningViewMode ||
         // 视图切换过渡中（单图→双图/三图、双图→三图等"变多"方向）：隐藏"新布局之外、与动画无关"
         // 的非活跃邻图，防止它们从半透明框架/屏幕边缘漏出（容器/Swiper 恒 overflow:visible）。
         // 但放行正在退出的图（isExitingOnViewModeChange，双图/三图→单图 时需可见以播放退出动画），
@@ -3221,8 +3283,11 @@ function SwiperLoopCarousel({
       // overflow 全 visible（横/纵都能溢出透出），横向是否被裁完全交给上面的 clip-path
       overflow: "visible",
       ...(horizontalClip ? { clipPath: horizontalClip, WebkitClipPath: horizontalClip } : {}),
-      // neighborHidden（过渡期隐藏无关邻图）或 Dev"隐藏主图"（visibility 保留布局，仅不可见）
-      ...(neighborHidden || devHideMainImage ? { visibility: "hidden" } : {}),
+      // 始终显式写 visibility（不再"该隐藏才写、可见时省略该键"）：让 React 完全接管这个键，
+      // 从而使 handleSlideChangeTransitionEnd 里对 leaving card 的命令式 visibility:hidden 只是
+      // "提前量"，下一次 React 渲染必被正确值覆盖（该卡变回活跃时写 visible），杜绝命令式写入
+      // 落入 React style-diff 盲区而永久残留的历史卡死问题。视觉结果与原来逐位一致（未写=visible 与显式 visible 相同）。
+      visibility: neighborHidden || devHideMainImage ? "hidden" : "visible",
     };
     // 该滑片内容（图片+motion）与滑片外壳(overflow 裁剪)拆分：
     // - 非虚拟(小 n)：外壳 = SwiperSlide，内容放其内部
@@ -3271,6 +3336,12 @@ function SwiperLoopCarousel({
     const node: React.ReactElement = (
         <div
           data-img-index={index}
+          ref={(el) => {
+            // 登记当前已挂载的 slide 根节点，供 handleSlideChangeTransitionEnd 命令式收口用。
+            // cacheKey 已含 index，缓存命中复用的 node 携带的也是当初同一个 index 闭包，不会串位。
+            if (el) slideElMapRef.current.set(index, el);
+            else slideElMapRef.current.delete(index);
+          }}
           className="relative flex h-full min-h-0 w-full items-center justify-center"
           style={innerDivStyle}
         >
@@ -3732,7 +3803,7 @@ function SwiperLoopCarousel({
               onSwiper={handleSwiperInit}
               onSlideChange={handleSlideChange}
               onSlideChangeTransitionStart={() => setIsSwipeAnimating(true)}
-              onSlideChangeTransitionEnd={() => setIsSwipeAnimating(false)}
+              onSlideChangeTransitionEnd={handleSlideChangeTransitionEnd}
               className={`absolute inset-0 h-full w-full${isTransitioningViewMode ? " !overflow-visible" : ""}`}
               wrapperClass="swiper-wrapper h-full min-h-0"
               style={
