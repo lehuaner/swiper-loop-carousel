@@ -742,6 +742,10 @@ function SwiperLoopCarousel({
   });
   const [viewModeEpoch, setViewModeEpoch] = useState(0);
   const swiperRef = useRef<SwiperClass | null>(null);
+  // 本轮切换动画的"最初起点中心"下标：仅当从空闲进入动画(!swiper.animating)时更新为切换前中心，
+  // 连续/重叠点击(仍在动画中)保持最早起点不覆盖。退场侧动态放行张数 spanSlots=|realIndex-此值|（按 dir 取方向），
+  // 使单次切换只放行真正的退场图（避免相邻远邻在视口边缘露头闪现）、连续切换放行多张（不截断退场）。
+  const retreatFromRef = useRef<number>(-1);
   // .swiper-wrapper 元素：虚拟模式图片分层经 createPortal 渲染到该节点内，继承 Swiper 的 transform
   const wrapperElRef = useRef<HTMLElement | null>(null);
   // Swiper 已挂载且有 wrapper 节点后置真，触发分层 portal 渲染
@@ -1566,6 +1570,13 @@ function SwiperLoopCarousel({
       slideDirectionRef.current = dir;
 
       const doSwitch = () => {
+        // 本轮退场起点：仅当从空闲进入动画（Swiper 尚未在动）时记为“切换前中心”；连续/重叠点击
+        // （仍在动画中）保持最早起点不覆盖。退场侧动态放行张数 = |realIndex 相对此起点的跨越槽数|
+        // （见 renderSlideInner），单次=1、重叠自动累加。必须在 swiper.slideTo 之前读 animating
+        // （slideTo 会同步把 animating 置 true）；此时 realIndexRef.current 仍是切换前中心。
+        if (!swiper.animating) {
+          retreatFromRef.current = realIndexRef.current;
+        }
         // 先让 Swiper 开始动画，再更新 React 状态
         // 避免 React re-render 期间 Swiper 内部状态被重置导致动画丢失
         if (swiper.realIndex !== idx) {
@@ -2913,16 +2924,22 @@ function SwiperLoopCarousel({
     neighborHideContextRef.current = { realIndex, n, viewMode, activeIndices, deletingId, isTransitioningViewMode };
   }, [realIndex, n, viewMode, activeIndices, deletingId, isTransitioningViewMode]);
   const handleSlideChangeTransitionEnd = useCallback(() => {
-    const { realIndex: ri, n: nn, viewMode: vm, activeIndices: ai, deletingId: del, isTransitioningViewMode: transitioning } = neighborHideContextRef.current;
-    // 仅在“普通切换落位”且 nn>0 时命令式收口；删除/视图切换有自己的可见性规则，不插手。
-    if (del == null && !transitioning && nn > 0) {
-      // 与 isLeavingCard 同一公式算出“刚飞出的那一张”的下标：dir=1→(ri+n-1)%nn、dir=-1→(ri+vm)%nn。
-      const leavingRelIdx = slideDirectionRef.current === -1 ? vm : nn - 1;
-      const leavingIdx = (((ri + leavingRelIdx) % nn) + nn) % nn;
-      if (!ai.has(leavingIdx)) {
-        const el = slideElMapRef.current.get(leavingIdx);
-        if (el && el.isConnected) el.style.visibility = "hidden";
+    const { realIndex: ri, n: nn, activeIndices: ai, deletingId: del, isTransitioningViewMode: transitioning } = neighborHideContextRef.current;
+    // 仅在“普通切换真正落位”（非删除/视图切换、且 Swiper 已不再 animating）时命令式收口。
+    // !animating 守卫很关键：连续/重叠切换时，被中断那次也会触发 transitionEnd，若那时就收口会把
+    // 仍在飞出的退场图截断。只有最后一次 transitionEnd（无后续过渡、animating=false）才收口。
+    if (del == null && !transitioning && nn > 0 && !swiperRef.current?.animating) {
+      // 动画期间为“保证退场图完整飞出”放行了整个近活跃窗口，落位后这些非活跃邻图（进入侧、退场
+      // 两侧都有）都要等 isSwipeAnimating=false 那次全量重渲染(~16ms)才隐藏，期间在视口左右边缘同时
+      // 闪现（点下一张时右侧邻居更贴近视口、闪得明显；点上一张则左侧明显）。这里对已挂载的全部
+      // 非活跃 slide（常数级 ~11 项，O(1)）即时写 hidden，一次性抹掉两侧残影。React 已全权接管 visibility：
+      // 这些卡稳态即 hidden（下次渲染同值），将来变活跃时 React 写 visible 恢复，不会卡死。
+      for (const [idx, el] of slideElMapRef.current) {
+        if (!ai.has(idx) && el.isConnected) el.style.visibility = "hidden";
       }
+      // 真正落位：本轮退场动画已结束，复位退场起点为当前中心，使下一轮（含不经过 goToIndex 的拖拽
+      // 滑动）的 spanSlots 从当前中心重新累计——起点=当前中心时距离即新跨越槽数，语义与按钮切换一致。
+      retreatFromRef.current = ri;
     }
     setIsSwipeAnimating(false);
   }, []);
@@ -3247,31 +3264,46 @@ function SwiperLoopCarousel({
     // 例外四：删除窗口内"从右侧进入新末位的下一张图"（deleteEntryTarget）非活跃却要播放与切换
     //        相同的"缩放+淡入+飞入"，若被此处隐藏，其飞入全程不可见，重排后静置归位则表现为
     //        新图"直接出现"而非飞入。故删除期间放行它，保证飞入可见。
-    // 例外三（收窄版）：普通滑动过渡中（isSwipeAnimating）过去会放行整个 nearActiveSet（realIndex±5）
-    // 的非活跃邻图，导致"落位前后活跃行两侧的远邻各闪现一下又消失"（实测 ~50ms 收口延迟期可见）。
-    // 这里改为：动画期间只放行"正在飞出视口的那一张"（leaving card），其余远邻始终隐藏。
-    // relIdx 以新 realIndex 为基准（goToIndex 已同步提交 realIndex）：
-    //   - dir=1（向后翻，正序）：飞出视口左缘的是 realIndex-1，其 relIdx = n-1；
-    //   - dir=-1（向前翻）：飞出视口右缘的是 realIndex+viewMode，其 relIdx = viewMode。
-    // 全部走 innerDivStyle 声明式控制 visibility，不做命令式 style 覆盖（避免 React 不管理该键时
-    // 内联样式无法被回收、卡片永久卡死的历史问题）。
-    const leavingRelIdx = slideDirectionRef.current === -1 ? viewMode : n - 1;
-    const isLeavingCard =
-      isSwipeAnimating && !isTransitioningViewMode && relIdx === leavingRelIdx;
-    // 例外一（收紧）：被删图在飞出动画期间（重排提交前，deletingReshapedRef=false）即使已非
-    // 活跃也保持可见。但豁免必须限定在"重排提交前"：重排后该下标已换为另一张幸存图（被删图已从
-    // 数组移除），若仍按 lastDeletedIndexRef===index 豁免，会让占用该下标的图在后续普通切换中
-    // 永久保持可见（而 lastDeletedIndexRef 只在下次删除/prune 时复位）。故加上 deletingReshapedRef
-    // 门控：重排提交后豁免立即失效，零延迟、纯声明式。
+    // 例外三（精准放行 + 动态 span）：普通滑动过渡中（isSwipeAnimating）只放行“飞入主体(active) +
+    // 退场侧正在飞出的若干张”，隐藏进入侧远邻与更外侧邻居——否则它们静止位就压着视口左右边缘（单图约
+    // 露 17~18px），动画起止段会露头、到落位才收口，视觉上即“切换前/后左右闪一下”（点下一张右侧进入邻居
+    // 更贴边、闪得明显；点上一张则左侧）。退场侧=飞行反方向：dir=1 内容左移→退场在左(relIdx 接近 n)、
+    // dir=-1 内容右移→退场在右(relIdx 接近 viewMode)。放行张数不再是固定值，而是等于“本轮动画从最初
+    // 起点(retreatFromRef)到当前中心实际跨越的槽数”（上限 RETREAT_MAX）：单次切换 span=1 → 只放行真正
+    // 的退场图，消除相邻远邻(如 relIdx n-2)贴视口边缘的露头闪现；连续/重叠点击 span 自动累加 → 覆盖所有
+    // 仍在飞出的退场图、不截断退场动画；远距离跳转按上限收敛，与既有固定窗口行为一致。落位后残留再由
+    // handleSlideChangeTransitionEnd 命令式即时收口兜底。
+    const RETREAT_MAX = 4;
+    const spanFrom = retreatFromRef.current;
+    let spanSlots = 1;
+    if (spanFrom >= 0 && n > 0) {
+      const rawSpan =
+        slideDirectionRef.current === -1
+          ? ((spanFrom - realIndex) % n + n) % n
+          : ((realIndex - spanFrom) % n + n) % n;
+      spanSlots = Math.min(Math.max(rawSpan, 1), RETREAT_MAX);
+    }
+    const onRetreatSide =
+      slideDirectionRef.current === -1
+        ? relIdx >= viewMode && relIdx < viewMode + spanSlots
+        : relIdx >= n - spanSlots;
+    const swipeKeepVisible = isActive || onRetreatSide;
+    // 退场放行卡（动画期间为“看到旧图飞出”而保持可见的非活跃邻图）：它最终停在“左/右邻静止
+    // 位”，单图下右/左缘会露出 ~18px。收口靠 Swiper transitionEnd 事件，该事件比“视觉到位”晚约 1 帧，
+    // 造成“动画结束后贴边一条旧图闪现”（进入侧靠 neighborHidden 即时隐藏无此问题，只有退场放行侧）。
+    // 解法：给这些退场放行卡的内层图片(opacity 动画层)一个“贴边淡出”过渡——ease 后段起步慢，前 ~200ms
+    // （仍在中心区、真正在飞出）近乎不透明保持可见，接近贴边(220-400ms)才淡到 0，先于 transitionEnd 收口
+    // 消除那 1 帧实心残影。纯 CSS 过渡、不新增每帧 JS；空闲/非退场态不写 opacity，稳态与原来逐位一致。
+    const isRetreatFading = !isActive && isSwipeAnimating && !isTransitioningViewMode && onRetreatSide && !deleteEntryTarget;
     const neighborHidden =
       !isActive &&
-      !isLeavingCard &&
       (lastDeletedIndexRef.current !== index || deletingReshapedRef.current) &&
       !deleteEntryTarget &&
       (
-        // 非视图切换（含普通滑动动画与空闲）：非活跃邻图一律隐藏。动画期间唯一被豁免的是
-        // leaving card（上面 !isLeavingCard 已拦截），其余远邻不再闪现。
-        !isTransitioningViewMode ||
+        // 空闲（非视图切换、非滑动动画）：隐藏非活跃邻图。
+        (!isTransitioningViewMode && !isSwipeAnimating) ||
+        // 滑动动画中：放行飞入主体与退场侧，隐藏其余（进入侧远邻等），消除贴边闪现。
+        (!isTransitioningViewMode && isSwipeAnimating && !swipeKeepVisible) ||
         // 视图切换过渡中（单图→双图/三图、双图→三图等"变多"方向）：隐藏"新布局之外、与动画无关"
         // 的非活跃邻图，防止它们从半透明框架/屏幕边缘漏出（容器/Swiper 恒 overflow:visible）。
         // 但放行正在退出的图（isExitingOnViewModeChange，双图/三图→单图 时需可见以播放退出动画），
@@ -3288,6 +3320,15 @@ function SwiperLoopCarousel({
       // "提前量"，下一次 React 渲染必被正确值覆盖（该卡变回活跃时写 visible），杜绝命令式写入
       // 落入 React style-diff 盲区而永久残留的历史卡死问题。视觉结果与原来逐位一致（未写=visible 与显式 visible 相同）。
       visibility: neighborHidden || devHideMainImage ? "hidden" : "visible",
+      // 退场放行卡的贴边淡出（见上方 isRetreatFading 注释）：只作用于“动画期间被放行的退场侧非活跃卡”。
+      // 放在本外壳层：内层图片(motion.div/AnimatedSlideImg)的 opacity 动画带更高优先级 inline opacity 与
+      // !important，外壳 opacity 作为祖先仍能乘算生效；非退场态不写这两属性，稳态零变化、不影响其它动画。
+      // delay 240ms：飞出前 ~240ms（离中心、仍在大幅滑行的主段）完全不透明，保证“旧图滑出”观感不被削弱；
+      // 之后 110ms 线性淡到 0，在卡片贴边静止(总时长~400ms)前约 2~3 帧就归零，早于 transitionEnd 收口，
+      // 消除贴边实心残影。
+      ...(isRetreatFading
+        ? { opacity: 0, transition: "opacity 110ms linear 240ms" }
+        : {}),
     };
     // 该滑片内容（图片+motion）与滑片外壳(overflow 裁剪)拆分：
     // - 非虚拟(小 n)：外壳 = SwiperSlide，内容放其内部
@@ -3312,7 +3353,7 @@ function SwiperLoopCarousel({
       isActive, wasActiveMap.get(index), deletedInActiveRow, groupShiftOn, rider, deleteShiftActive,
       deleteFillTarget, fillSettledAt, deleteSurvivorFillTarget, survivorSettledAt,
       deleteEntryTarget, entryNoFade, imgOverflowing, isFirstInRow, isLastInRow, inRow,
-      horizontalClip, movingClipPath, neighborHidden, overflowClip, slideClassName, deleteTranslateX,
+      horizontalClip, movingClipPath, neighborHidden, isRetreatFading, overflowClip, slideClassName, deleteTranslateX,
       // 直接透传给子组件的 motion / ref（对象身份，非读取 .get()，MotionValue 本身稳定则不触发失效）
       motionsNow, groupShiftX,
       // 闭包内直接捕获进 JSX 的组件级 state/props/ref（身份变化必须使缓存失效）
