@@ -6,7 +6,7 @@ import { motion, AnimatePresence, useMotionValue, animate, MotionValue } from "m
 import { Swiper, SwiperSlide } from "swiper/react";
 import { Virtual } from "swiper/modules";
 import type { Swiper as SwiperClass } from "swiper";
-import { playSuction } from "./suctionOverlay";
+import { playSuction, warmupSuction } from "./suctionOverlay";
 
 // 连续删除时，排队项没有点击事件上下文，且 DOM 已因前序删除重排；按幻灯片索引从 DOM 实时解析
 // 删除按钮中心（吸入目标）与该幻灯片主图（网格形变纹理来源）。循环/虚拟模式下同 index 可能有
@@ -86,9 +86,12 @@ import {
   type ImageMotions,
   computeZoomTransform,
   computeContainedSize,
+  computeZoomUiOpacity,
+  RATIO_MAX_SINGLE,
+  RATIO_MAX_DUAL,
   formatFileSize,
 } from "./utils";
-import { useImagePreloader, useWindowWidth, useInView } from "./hooks";
+import { useImagePreloader, useWindowWidth, useWindowHeight, useWindowAspect, useInView } from "./hooks";
 import { useCarouselI18n, useCarouselLang } from "./i18n";
 import AnimatedSlideImg from "./AnimatedSlideImg";
 import HintBar from "./HintBar";
@@ -219,6 +222,11 @@ const carThemeStyles = `
 .car__pill{background:var(--car-pill)}
 .car__sep{background:var(--car-sep)}
 .car__nav:hover{background:var(--car-nav-hover)}
+.car__nav:active{background:var(--car-nav-hover)}
+/* 触摸屏无真 hover：点击后 :hover 会"粘住"导致区域高亮/提示气泡常驻。仅触摸设备上
+   取消 hover 表现，高亮只在按住(:active)的瞬间出现。用 !important 提高优先级以
+   覆盖 Tailwind 的 .group:hover .group-hover:opacity-100（特异性更高）。 */
+@media (hover:none){.car__nav:hover{background:transparent !important}.group:hover .car__tooltip,.car__tooltip{opacity:0 !important}}
 .car__placeholder{background:var(--car-placeholder)}
 .car__strip{background:var(--car-strip-bg)}
 `;
@@ -280,12 +288,14 @@ const MemoAnimatedSlideImg = React.memo(
     prev.deleteTranslateX === next.deleteTranslateX &&
     prev.groupShiftX === next.groupShiftX &&
     prev.groupShiftScaleX === next.groupShiftScaleX &&
+    prev.zoomScale === next.zoomScale &&
     prev.movingClipPath === next.movingClipPath &&
     prev.viewModeOffsetX === next.viewModeOffsetX &&
     prev.entryXFrom === next.entryXFrom &&
     prev.entryScaleFrom === next.entryScaleFrom &&
     prev.entryXOffset === next.entryXOffset &&
     prev.isExitingOnViewModeChange === next.isExitingOnViewModeChange &&
+    prev.entryNoFade === next.entryNoFade &&
     prev.showSpinner === next.showSpinner &&
     prev.downloadProgress === next.downloadProgress &&
     prev.progressKnown === next.progressKnown &&
@@ -316,6 +326,27 @@ interface ThumbnailItemProps {
 }
 /** 缩略图删除时向上飞出的高度 */
 const THUMB_FLY_UP = THUMB_SIZE + 16;
+/**
+ * 底部缩略图行的恒定高度：所有视图模式统一使用，作为容器高度与缩略图垂直居中基准。
+ * 取单图高亮框高度（CENTER_THUMB_SIZE + 8），既容纳单图放大后的中心图，又保证
+ * 单图↔双/三图切换时容器高度不变 → 缩略图行中心不位移 → 消除 Y 轴跳变。
+ * 高亮边框仍按 viewMode 动画其自身高度（相对容器居中），不影响本行位置。
+ */
+const STRIP_ROW_HEIGHT = CENTER_THUMB_SIZE + 8;
+// ── 矮视口（手机横屏）紧凑模式：缩略图条整体缩小并压缩底部预留，把高度还给主图 ──
+// 判据用"视口高度"而非 UA 设备检测：正常窗口高度 ≤480 的唯一场景就是手机横屏
+// （iPhone 横屏 360〜430px）；电脑/笔记本（≥700）、平板横屏（≥768）、手机竖屏（≥600）天然不触发。
+const STRIP_COMPACT_MAX_H = 480;
+/** 紧凑模式：底部预留 140→96（主图高 +44px） */
+const STRIP_BOTTOM_COMPACT = 96;
+/** 紧凑模式：缩略图条（含 mt-17 共 105px 流高）整体缩放比 */
+const STRIP_COMPACT_SCALE = 0.72;
+/** 吸入动画时长（ms）：被删图 canvas 网格形变吸入删除钮 */
+const DELETE_SUCTION_MS = 1400 / 3.5;
+/** 删除切换动画时长（ms）：吸入结束后右段补位平移 + 新入图入场，与常规切换(0.4s)同源同速 */
+const DELETE_MOTION_MS = 400;
+/** 切换动画结束后、重排提交前的稳定缓冲（ms） */
+const DELETE_SETTLE_BUFFER_MS = 60;
 const ThumbnailItem = React.memo(
   function ThumbnailItem({
     img,
@@ -510,6 +541,8 @@ function SwiperLoopCarousel({
   loadDebounceMs,
   maxTasks,
   theme = "dark",
+  deleteMode = "parallel",
+  debugPanel = false,
 }: {
   images: GalleryImage[];
   onNeedMore?: () => void;
@@ -579,6 +612,11 @@ function SwiperLoopCarousel({
   maxTasks?: number;
   /** 整体配色主题："dark"（默认，黑色控件亮度较纯黑提升 10%）或 "light"（亮色）。调用方可按需切换 */
   theme?: CarouselTheme;
+  /** 多图删除动画时序："parallel"（默认，吸入与图片运动/切换同时）、"serial"（吸入结束后再切换）。
+   *  仅外部通过此参数控制；面板内可视化切换由 debugPanel 提供，不影响外部默认行为。 */
+  deleteMode?: "serial" | "parallel";
+  /** 是否显示右上角 Dev 调试面板（默认 false）。仅显式开启才渲染，外部引用不会出现。 */
+  debugPanel?: boolean;
 }) {
   const t = useCarouselI18n();
   const lang = useCarouselLang();
@@ -592,6 +630,9 @@ function SwiperLoopCarousel({
   const [removeEpoch, setRemoveEpoch] = useState(0);
   // 删除提交后递增：驱动活跃行"未被删除的幸存图"按切换动画重放入场
   const [deleteEpoch, setDeleteEpoch] = useState(0);
+  // 串行删除门控：false=吸入阶段（右段与新入图静止，仅吸入动画在跑），true=切换阶段（入场+补位平移）。
+  // 吸入结束时由 Timer A 置 true，驱动 deleteEntryTarget 生效。
+  const [deleteMotionStarted, setDeleteMotionStarted] = useState(false);
   // 最近一次删除的被删图下标（重排前的原始下标）。渲染时据此判断某图是否位于被删图右侧：
   // 仅右侧幸存图(index >= 该值)重放"下一张"切换动画，左侧幸存图保持不动。
   const lastDeletedIndexRef = useRef<number>(-1);
@@ -658,9 +699,16 @@ function SwiperLoopCarousel({
   // 若不合并，残留的多套 500ms 定时器会在最后一张图已静置稳定后异步晚触发——再次
   // updateSlides/slideTo 拨动 Swiper 触发 slideChange，导致已到位的图被重新判为新图。
   const settleResetTimerRef = useRef<number | null>(null);
+  // 删除窗口过期后的"主动清算"定时器：pruneDeleteFillState 原本只在"下一次删除开始"时才被调用，
+  // 导致"删除一张后不再删除"时 lastDeletedIndexRef 永不复位——占用被删下标的新图会在后续普通
+  // 切换中被 neighborHidden 的 `lastDeletedIndexRef.current !== index` 前置永久短路放行而保持可见。
+  // 这里在最后一次静置时刻 + DELETE_FILL_VALID_MS 之后主动 prune 一次（与"下次删除时清算"完全
+  // 同一幂等效果，纯复位 ref、不触发重放、无竞争），复位 lastDeletedIndexRef / deletingReshapedRef。
+  const deletePruneTimerRef = useRef<number | null>(null);
   useEffect(() => {
     return () => {
       if (settleResetTimerRef.current != null) window.clearTimeout(settleResetTimerRef.current);
+      if (deletePruneTimerRef.current != null) window.clearTimeout(deletePruneTimerRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -711,6 +759,10 @@ function SwiperLoopCarousel({
   });
   const [viewModeEpoch, setViewModeEpoch] = useState(0);
   const swiperRef = useRef<SwiperClass | null>(null);
+  // 本轮切换动画的"最初起点中心"下标：仅当从空闲进入动画(!swiper.animating)时更新为切换前中心，
+  // 连续/重叠点击(仍在动画中)保持最早起点不覆盖。退场侧动态放行张数 spanSlots=|realIndex-此值|（按 dir 取方向），
+  // 使单次切换只放行真正的退场图（避免相邻远邻在视口边缘露头闪现）、连续切换放行多张（不截断退场）。
+  const retreatFromRef = useRef<number>(-1);
   // .swiper-wrapper 元素：虚拟模式图片分层经 createPortal 渲染到该节点内，继承 Swiper 的 transform
   const wrapperElRef = useRef<HTMLElement | null>(null);
   // Swiper 已挂载且有 wrapper 节点后置真，触发分层 portal 渲染
@@ -733,6 +785,10 @@ function SwiperLoopCarousel({
   // 使 `isDev && ...` 的浮层 JSX 整体被 DCE 排除，状态恒为默认值零开销）=====
   const isDev = process.env.NODE_ENV !== "production";
   const [devPanelOpen, setDevPanelOpen] = useState(false);
+  // Dev 面板对 deleteMode 的临时覆盖（null=不覆盖，沿用 deleteMode prop）。仅供面板实测，不影响外部。
+  const [devSerialOverride, setDevSerialOverride] = useState<boolean | null>(null);
+  // 最终是否串行：dev 覆盖优先，否则取 deleteMode prop（默认 parallel）。
+  const serialAnim = devSerialOverride ?? (deleteMode === "serial");
   // 隐藏底部缩略图条
   const [devHideThumbs, setDevHideThumbs] = useState(false);
   // 关闭"被删除图片"的飞出/吸入动画（改为瞬时移除）
@@ -741,12 +797,20 @@ function SwiperLoopCarousel({
   const [devDisableSurvivorAnim, setDevDisableSurvivorAnim] = useState(false);
   // 隐藏主图（大图本身）
   const [devHideMainImage, setDevHideMainImage] = useState(false);
+  // Dev：关闭吸入层 WebGL 上下文池（回退每次新建上下文，供 A/B 对比性能）
+  const [devDisableSuctionPool, setDevDisableSuctionPool] = useState(false);
+  // Dev：吸入画布用满分辨率（关闭 L1 按面积降采样），供 A/B 对比每帧 GPU fill/帧率
+  const [devSuctionFullRes, setDevSuctionFullRes] = useState(false);
   // 用于检测 isKeyboardActive 是否刚从 true→false（长按松开），避免挂载时误触恢复逻辑
   const prevHoldRef = useRef(false);
   const [pendingRealIndex, setPendingRealIndex] = useState(0);
   const pendingRealIndexRef = useRef(0);
   const stripX = useMotionValue(0);
   const stripScale = useMotionValue(1);
+  // "放大渐隐"（单/双/三图）：由活跃行图缩放倍数推导的周边 UI 不透明度（1=默认全不透明，
+  // 任一图最短边占"基准格位"（单图=视口/双图=1/2屏/三图=1/3屏）达 100% 时=0）。仅 MotionValue
+  // 逐事件驱动、不触发 React 重渲染；共享给左右箭头/缩略图条/提示条/名称栏+操作钮/设置菜单/重命名面板/框架层。
+  const zoomUiOpacity = useMotionValue(1);
   const stripAnimRef = useRef<ReturnType<typeof animate> | null>(null);
   const stripDragRef = useRef({
     startX: 0,
@@ -759,6 +823,8 @@ function SwiperLoopCarousel({
   const stripDragIdxRafRef = useRef<number | null>(null);
   // 已预加载的缩略图 URL 集合：避免同一 URL 重复 new Image() 预加载
   const thumbPreloadCacheRef = useRef<Set<string>>(new Set());
+  // 删除窗口内为"新入图"缩略图做即时预载的缓存去重：删除入口显式 new Image() 预热，避免重复请求
+  const warmedThumbCacheRef = useRef<Set<string>>(new Set());
   // 缩略图自然尺寸（img.id -> {w,h}）：原图未就绪时，视图切换的缩放补偿（entryScaleFrom）需要按
   // "当前实际显示内容"（缩略图）的宽高比计算，否则退化为 newVM/prevVM 会因宽高比不符而"中心图突然放大"。
   // 以 img.id 为键，避免删除重排后索引漂移。
@@ -1006,6 +1072,7 @@ function SwiperLoopCarousel({
       thumbGroupShiftX.set(0);
       thumbGroupShiftAnimRef.current?.stop();
       setDeletingId(img.id);
+      setDeleteMotionStarted(!serialAnim); // 串行:先进吸入阶段(右段与新入图静止);并行:立即 true → 入场/平移同帧触发
       // 上一删除可能仍在"重排已提交"抑制窗口内：新删除必须立即退出该窗口，
       // 否则 deleteShiftActive/deleteEntryTarget 里的 !deletingReshapedRef 判定为假，
       // 本次补位/入场动画整组失效（表现为"原地消失后从右侧飞入"的概率性跳变）。
@@ -1032,8 +1099,8 @@ function SwiperLoopCarousel({
       // 目标 = 删除按钮中心（运行时获取，不写死像素）；卡片尺寸 = 删除前图片的真实可见矩形。
       // 方案B错峰：吸口 canvas 初始化（建 canvas + append 触发 layout、纹理 drawImage、网格顶点构建）
       // 是删除点击帧的主线程重活（trace 里 ~19.5ms 长任务），会挤占右侧平移/缩略图合并动画的首帧。
-      // 先把轻量的右侧平移/缩略图合并（上方 thumbGroupShiftX / 下方 groupShiftX animate）同步送出，
-      // 再在下一帧 rAF 初始化吸口并隐藏 DOM 图：点击帧立即响应动画、不被同步重活打断。
+      // 先把轻量的缩略图合并（thumbGroupShiftX）同步送出（缩略图动画保持原时序不变），主图右段共享平移
+      // groupShiftX 则延后到吸入结束再启动（串行，见 Timer A）；再在下一帧 rAF 初始化吸口并隐藏 DOM 图。
       // suctionOverlay 已做"首帧同步绘制"，故 rAF 回调里 canvas 立即接管画面，不会出现空档。
       const runFallbackSuction = () => {
         const suckX = Math.max(120, containerWidth * 0.38);
@@ -1045,6 +1112,9 @@ function SwiperLoopCarousel({
         animate(m.rotate, 14, { duration: 0.4, ease: [0.55, 0, 1, 0.45] });
       };
       // Dev: 关闭"被删图"动画 → 瞬间隐藏 DOM（后续仍走 460ms 重排移除）。
+      // 删除均使用吸入 canvas（被删图网格形变吸入删除钮）。单图模式新入图不在吸入期间同时切换——
+      // 改为吸气完成后（重排时）再播放切换入场（见 reflowIncoming 抑制与 deleteEntryTarget 的 viewMode 门控），
+      // 二者串行、互不遮挡。
       if (devDisableDeleteAnim) {
         m.opacity.set(0);
       } else if (effTarget && effImgEl && effImgEl.isConnected) {
@@ -1060,7 +1130,18 @@ function SwiperLoopCarousel({
                     return { x: r.left, y: r.top, w: r.width, h: r.height };
                   })()
                 : undefined;
-            playSuction({ imgEl: effImgEl, target: effTarget, durationMs: 1400 / 3.5, crop });
+            playSuction({
+              imgEl: effImgEl,
+              target: effTarget,
+              durationMs: DELETE_SUCTION_MS,
+              crop,
+              poolOverlay: !devDisableSuctionPool,
+              fullRenderScale: devSuctionFullRes,
+              // 单图+并行：吸入层挂 .swiper（wrapper 的直接父），z-index:-1 → 与 wrapper(z auto=0) 同处 .swiper 上下文，
+              // wrapper 整体稳定盖住吸入层 → 新入图(在 wrapper 内)不被遮挡；避开吸入挂进 wrapper 的 transform 上下文造成的堆叠歧义。
+              // 其余（多图/串行）传 undefined → 维持挂 body + fixed + 最大 z（行为零变）。
+              container: !serialAnim && viewMode === 1 ? (swiperRef.current?.el ?? undefined) : undefined,
+            });
             m.opacity.set(0); // 隐藏原 DOM 图，交由 canvas 覆盖层呈现吸入过程
           } else {
             runFallbackSuction();
@@ -1082,20 +1163,23 @@ function SwiperLoopCarousel({
         );
       }
 
-      // ===== 删除发生在活跃行内 → 驱动"右侧整段共享平移"（源码级改造） =====
-      // 不调用 swiper.slideToLoop 去"切到下一张"（那会带动整条 wrapper、连左侧卡一起移）。而是把
-      // "被删图右侧所有图左移一格"表达为**一个共享 motion 值** groupShiftX 从 0 → -一格槽距：
-      // 右侧每张卡在同一渲染里读取该值 → 视觉上即一次 wrapper 平移级别的平滑整段移动（同一动画源零失步）。
-      // 被删图左侧的卡不读取 → 原地不动。与切换同速（0.4s easeOut）、同位移（一整格槽距）。
-      if (index >= wasReal && index < wasReal + viewMode && !devDisableSurvivorAnim) {
-        const gGap = viewMode > 1 ? 8 : 0;
-        const gSlotW = containerWidth > 0 ? (containerWidth - (viewMode - 1) * gGap) / viewMode : containerWidth;
-        const gShift = containerWidth > 0 ? gSlotW + gGap : 0;
-        if (gShift > 0) {
-          groupShiftAnimRef.current?.stop();
-          groupShiftAnimRef.current = animate(groupShiftX, -gShift, { duration: 0.4, ease: "easeOut" });
+      // ===== 删除发生在活跃行内 → 右段"共享平移补位"（串行：吸入结束后才启动） =====
+      // 右侧所有图左移一格表达为共享 motion 值 groupShiftX 从 0 → -一格槽距：右侧每卡读同一值 →
+      // 一次 wrapper 级平滑整段移动（单动画源零失步）；左侧卡不读 → 原地不动。与切换同速、同位移。
+      // 串行观感：吸入阶段 groupShiftX 恒为 0（右段静止），吸入结束（Timer A）才 animate。
+      // 单图（viewMode===1）无其它可见幸存图 → 本就跳过该平移。
+      const beginSwitchMotion = () => {
+        // 并行：与原实现一致，不额外限定 viewMode>1；串行：仅多图需共享平移（单图无右幸存段）。
+        if ((!serialAnim || viewMode > 1) && index >= wasReal && index < wasReal + viewMode && !devDisableSurvivorAnim) {
+          const gGap = viewMode > 1 ? 8 : 0;
+          const gSlotW = containerWidth > 0 ? (containerWidth - (viewMode - 1) * gGap) / viewMode : containerWidth;
+          const gShift = containerWidth > 0 ? gSlotW + gGap : 0;
+          if (gShift > 0) {
+            groupShiftAnimRef.current?.stop();
+            groupShiftAnimRef.current = animate(groupShiftX, -gShift, { duration: DELETE_MOTION_MS / 1000, ease: "easeOut" });
+          }
         }
-      }
+      };
 
       // ===== 删除：目标 =====
       // 被删图自身向上缩小飞出；其右侧整段图由共享 groupShiftX 一次性平滑左移一格（同上 0.4s 同步），
@@ -1127,9 +1211,35 @@ function SwiperLoopCarousel({
       const entering = images[enteringIdx];
       if (entering && !removedIdsRef.current.has(entering.id)) {
         preloader.requestLoad(enteringIdx);
+        // 缩略图同样要在删除窗口内可见：新入图非激活在视口右缘之外，其 <img> 之前按 lazy 未发起
+        // 加载。这里显式预载其缩略图，浏览器缓存随后会立即服务飞入卡片的 <img>（与上面 eager 配合），
+        // 保证飞入的 0.4s 内即有内容、不会"空白滑入后才直接出现"。
+        const enterThumb = entering.thumbSrc;
+        if (enterThumb && !enterThumb.startsWith("blob:")) {
+          warmedThumbCacheRef.current.has(enterThumb) ||
+            (warmedThumbCacheRef.current.add(enterThumb), (new Image() as HTMLImageElement).src = enterThumb);
+        }
       }
-      // 立即递增 deleteEpoch：左移补位与飞出同一时刻启动（旧链路在 460ms 重排后才启动，导致两者串行）
-      setDeleteEpoch((e) => e + 1);
+      // ===== 串行删除时序 =====
+      // 吸入阶段（Timer A 之前）：deleteMotionStarted=false、deleteEpoch 未递增、groupShiftX 未 animate
+      //   → 被删图右侧整段与新入图完全静止，仅吸入动画在跑（吸入时长与当前一致）。
+      // Timer A（吸入结束）：置 deleteMotionStarted → 新入图 deleteEntryTarget 生效播放"切换入场"；
+      //   递增 deleteEpoch（入场一次性触发键）；启动 groupShiftX 右段共享平移补位。
+      // Timer B（切换结束后）：执行下方重排提交体（原 460ms）。
+      // ===== 删除时序：串行(serialAnim) vs 并行(默认) =====
+      // 并行：吸入与图片运动/入场同时——点击帧即递增 deleteEpoch 并启动右段平移（等价改造前原行为）。
+      // 串行：吸入阶段右段与新入图静止，吸入结束(Timer A)才递增 epoch、置 deleteMotionStarted、启动平移。
+      const suctionWait = serialAnim && !devDisableDeleteAnim ? DELETE_SUCTION_MS : 0;
+      if (serialAnim) {
+        window.setTimeout(() => {
+          setDeleteMotionStarted(true);
+          setDeleteEpoch((e) => e + 1);
+          beginSwitchMotion();
+        }, suctionWait);
+      } else {
+        setDeleteEpoch((e) => e + 1);
+        beginSwitchMotion();
+      }
 
       window.setTimeout(() => {
         removedIdsRef.current.add(img.id);
@@ -1209,13 +1319,25 @@ function SwiperLoopCarousel({
         for (const id of relocateSurvivorFillIdsRef.current.keys()) {
           relocateSurvivorFillIdsRef.current.set(id, settleNow);
         }
-        // incoming（单图/双图/三图一致）的"重排后静置抑制二次入场"在此刻才生效：
-        // 删除窗口内它是 rider+deleteEntryTarget，正在播与切换同源的入场，不能静置；
+        // 安排"窗口过期后主动清算"：若此后没有新一轮删除刷新静置时刻并重置本定时器，则在最后一个
+        // 删除静置窗口自然过期后调一次 pruneDeleteFillState，复位 lastDeletedIndexRef / deletingReshapedRef，
+        // 杜绝被删下标在后续普通切换中被 neighborHidden 永久误放行可见。有后续删除时本定时器被重排到
+        // 更晚，最终只在真正静置满 DELETE_FILL_VALID_MS 后触发一次；prune 按时间戳惰性过期，与"下次删除
+        // 开始时清算"完全同一效果，不会提前清掉未过期项、不会重放入场动画。
+        if (deletePruneTimerRef.current != null) window.clearTimeout(deletePruneTimerRef.current);
+        deletePruneTimerRef.current = window.setTimeout(() => {
+          deletePruneTimerRef.current = null;
+          pruneDeleteFillState();
+        }, DELETE_FILL_VALID_MS + 120) as unknown as number;
+        // incoming（双图/三图）的"重排后静置抑制二次入场"在此刻才生效：
+        // 删除窗口内它是 rider+deleteEntryTarget，已播与切换同源的入场，不能静置；
         // 重排提交后它已落位，加入静置集合（此刻刷新为 settleNow），杜绝"落位后 isActive 闪断
-        // 再播一遍入场"（播放两遍切换动画）。它在删除窗口开始时未进集合（见上方注释），
-        // 这里按"进入新末位的那张图"（原 wasReal+viewMode → 重排后变 wasReal）补进。
+        // 再播一遍入场"（播放两遍切换动画），这里按"进入新末位的那张图"（原 wasReal+viewMode → 重排后变 wasReal）补进。
+        // 单图（viewMode===1）：吸入期间新入图未播任何入场（deleteEntryTarget / groupShift 均已按
+        // viewMode===1 关闭），因此重排时**不**静置它 → 它成为唯一活跃中心后正常播放切换入场（"先吸入、
+        // 再切入"串行衔接。见 deleteEntryTarget 与群移的 viewMode 门控）。
         const reflowIncoming = images[wasReal + viewMode];
-        if (reflowIncoming && !removedIdsRef.current.has(reflowIncoming.id)) {
+        if ((!serialAnim || viewMode > 1) && reflowIncoming && !removedIdsRef.current.has(reflowIncoming.id)) {
           relocateFillIdsRef.current.set(reflowIncoming.id, settleNow);
         }
         // ===== 共享平移：结束动画，但【不立即归零】 =====
@@ -1341,9 +1463,9 @@ function SwiperLoopCarousel({
           }
           if (!processed) serialDeleteLockRef.current = false; // 队列里没有可删项时才兜底释放
         }, DELETE_SERIAL_BUFFER_MS);
-      }, 460);
+      }, serialAnim ? suctionWait + DELETE_MOTION_MS + DELETE_SETTLE_BUFFER_MS : 460);
     },
-    [deletingId, getOrCreateImageMotions, images, n, viewMode, hasMore, preloader, pruneDeleteFillState, containerWidth, containerHeight, devDisableDeleteAnim, devDisableSurvivorAnim]
+    [deletingId, getOrCreateImageMotions, images, n, viewMode, hasMore, preloader, pruneDeleteFillState, containerWidth, containerHeight, devDisableDeleteAnim, devDisableSurvivorAnim, devDisableSuctionPool, devSuctionFullRes, serialAnim]
   );
   // 队列接力触发的后续删除必须命中"最新"的实现（重排后 images/deletingId 均更新）
   flyOutAndRemoveRef.current = flyOutAndRemove;
@@ -1422,6 +1544,23 @@ function SwiperLoopCarousel({
     }
   }, [isOpen, n, viewMode, changeViewMode]);
 
+  // ── 按屏幕宽高比（W÷H）自动收敛视图模式（仅"缩小"方向启用）──
+  // ratio ≤ 1（竖屏/窄屏）→ 单图；1 < ratio < 1.5 → 双图；ratio ≥ 1.5 → 三图。
+  // 只在视口变小导致当前模式超出可行档位时才自动降级；视口变大不自动升级：
+  // 当前是什么视图，放大后依然是什么视图（手动选择同理由升档也不覆盖，只受降档接管）。
+  // 同一比例判定兼用于右下角设置菜单的出现：能盛放双图才出菜单，能盛放三图才出三图选项。
+  const windowAspect = useWindowAspect();
+  const canFitDual = windowAspect > RATIO_MAX_SINGLE;
+  const canFitTriple = windowAspect >= RATIO_MAX_DUAL;
+  const ratioTier: 1 | 2 | 3 = !canFitDual ? 1 : !canFitTriple ? 2 : 3;
+  useEffect(() => {
+    if (!isOpen) return;
+    // 降级复用 changeViewMode 全套过渡动画，与张数限制（n 自动收敛 effect）同模式。
+    if (ratioTier < viewMode) {
+      changeViewMode(ratioTier);
+    }
+  }, [isOpen, ratioTier, viewMode, changeViewMode]);
+
   // 导航锁定时禁用 Swiper 触摸滑动
   useEffect(() => {
     const swiper = swiperRef.current;
@@ -1469,13 +1608,22 @@ function SwiperLoopCarousel({
       slideDirectionRef.current = dir;
 
       const doSwitch = () => {
+        // 本轮退场起点：仅当从空闲进入动画（Swiper 尚未在动）时记为“切换前中心”；连续/重叠点击
+        // （仍在动画中）保持最早起点不覆盖。退场侧动态放行张数 = |realIndex 相对此起点的跨越槽数|
+        // （见 renderSlideInner），单次=1、重叠自动累加。必须在 swiper.slideTo 之前读 animating
+        // （slideTo 会同步把 animating 置 true）；此时 realIndexRef.current 仍是切换前中心。
+        if (!swiper.animating) {
+          retreatFromRef.current = realIndexRef.current;
+        }
         // 先让 Swiper 开始动画，再更新 React 状态
         // 避免 React re-render 期间 Swiper 内部状态被重置导致动画丢失
         if (swiper.realIndex !== idx) {
+          // 显式传 speed：本实例 params.speed 可能被（viewMode 冻结等路径）置为 0 且未能恢复，
+          // 不传则 slideTo 用 params.speed=0 → 瞬移。实测显式传 400 即恢复平滑滑动。
           if (swiper.params.loop) {
-            swiper.slideToLoop(idx);
+            swiper.slideToLoop(idx, 400);
           } else {
-            swiper.slideTo(idx);
+            swiper.slideTo(idx, 400);
           }
           // 实际发生了滑动才标记跳转目标（抑制中间 slideChange）
           jumpTargetRef.current = idx;
@@ -1761,7 +1909,8 @@ function SwiperLoopCarousel({
           wideCount * THUMB_SIZE + (wideCount - 1) * THUMB_GAP;
         const initialBaseX = (initialStripWidth - THUMB_SIZE) / 2;
         // 根据 viewMode 偏移缩略图条位置，使高亮框内的图片组居中
-        const initialTargetX = initialBaseX - (idx + (vm - 1) / 2) * (THUMB_SIZE + THUMB_GAP) - (vm === 2 ? DUAL_HIGHLIGHT_EXTRA_GAP / 2 : 0);
+        // 对称分配双图额外间距，组中心落在高亮框中心，无需整条回中偏移
+        const initialTargetX = initialBaseX - (idx + (vm - 1) / 2) * (THUMB_SIZE + THUMB_GAP);
         stripX.set(initialTargetX);
         setPendingRealIndex(idx);
         pendingRealIndexRef.current = idx;
@@ -2170,13 +2319,37 @@ function SwiperLoopCarousel({
   }, [realIndex, isOpen]);
 
   const windowWidth = useWindowWidth();
-  const isNarrow = windowWidth < 1024;
+  const windowHeight = useWindowHeight();
+  // 手机横屏等矮视口 → 缩略图条紧凑模式（见 STRIP_COMPACT_MAX_H 注释）
+  const compactStrip = windowHeight > 0 && windowHeight <= STRIP_COMPACT_MAX_H;
+  // ── 全屏切换：监听 fullscreenchange 同步图标；对 documentElement 请求/退出全屏 ──
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const toggleFullscreen = useCallback(() => {
+    if (typeof document === "undefined") return;
+    if (!document.fullscreenElement) {
+      document.documentElement.requestFullscreen?.().catch(() => {});
+    } else {
+      document.exitFullscreen?.().catch(() => {});
+    }
+  }, []);
+  useEffect(() => {
+    const onFsChange = () => setIsFullscreen(Boolean(document.fullscreenElement));
+    document.addEventListener("fullscreenchange", onFsChange);
+    return () => document.removeEventListener("fullscreenchange", onFsChange);
+  }, []);
   const density = STRIP_DENSITY_CONFIG[stripDensityLevel];
-  const STRIP_VISIBLE = isNarrow ? 5 : density.visible;
-  const STRIP_DRAG_VISIBLE = isNarrow ? 11 : density.drag;
+  // 可见缩略图数：不再被 isNarrow 固定为 5（那会整体忽略"少/中/多"设置），
+  // 改为按实际可用宽度封顶：宽度足够（手机横屏 844px → 封顶 12）时少/中/多全部生效；
+  // 宽度不足（手机竖屏 390px → 封顶 5）自动降档，与原窄屏行为一致。
+  const stripFitPitch = THUMB_SIZE + THUMB_GAP;
+  const maxVisibleByWidth = Math.max(3, Math.floor((windowWidth - 32) / stripFitPitch));
+  const STRIP_VISIBLE = Math.min(density.visible, maxVisibleByWidth);
+  // 拖拽态项自带缩小（STRIP_DRAG_SCALE 最低 0.4，每项约 25.6px），按缩小后的宽度封顶；
+  // 390px 竖屏下 15 项也仅 384px，正常不会触发，保兼容极端窄窗口。
+  const STRIP_DRAG_VISIBLE = Math.min(density.drag, Math.max(7, Math.floor((windowWidth - 32) / (stripFitPitch * 0.4))));
   const STRIP_VISIBLE_COUNT =
     isStripDragging && dragMoved ? STRIP_DRAG_VISIBLE : STRIP_VISIBLE;
-  const STRIP_THUMB_PITCH = THUMB_SIZE + THUMB_GAP;
+  const STRIP_THUMB_PITCH = stripFitPitch;
   const STRIP_BASE_WIDTH =
     STRIP_DRAG_VISIBLE * THUMB_SIZE + (STRIP_DRAG_VISIBLE - 1) * THUMB_GAP;
   const STRIP_BASE_X = (STRIP_BASE_WIDTH - THUMB_SIZE) / 2;
@@ -2189,11 +2362,12 @@ function SwiperLoopCarousel({
     Math.min(1, (windowWidth - 32) / STRIP_BASE_WIDTH)
   );
   const STRIP_TARGET_IDX = pendingRealIndex;
+  // 双图额外间距已改为对称分配到两张中心图（见 stripItems 的 extraLeft：左 -EXTRA/2、右 +EXTRA/2），
+  // 组中心仍落在高亮框中心，故此处不再对整条做 -EXTRA/2 回中（否则会使右中心图与右邻间距被压缩）。
   const STRIP_TARGET_X =
     STRIP_BASE_WIDTH / 2 -
     THUMB_SIZE / 2 -
-    (STRIP_TARGET_IDX + (viewMode - 1) / 2) * STRIP_THUMB_PITCH -
-    (viewMode === 2 ? DUAL_HIGHLIGHT_EXTRA_GAP / 2 : 0);
+    (STRIP_TARGET_IDX + (viewMode - 1) / 2) * STRIP_THUMB_PITCH;
 
   // 高亮框尺寸：根据 viewMode 调整高亮缩放倍数（避免重叠）
   const HIGHLIGHT_CENTER_WIDTH = (() => {
@@ -2357,15 +2531,20 @@ function SwiperLoopCarousel({
     return () => controls.stop();
   }, [isStripDragging, dragMoved, STRIP_DRAG_SCALE, stripScale]);
 
-  // 跟踪 container 宽度，用于计算每张图片在当前视图模式下的目标 X 偏移
+  // 跟踪 container 尺寸，用于计算每张图片在当前视图模式下的目标 X 偏移
+  // 【手机错位根因】必须用 offsetWidth/offsetHeight（整数，与 Swiper 内部 getOuterSize 完全同口径），
+  // 不能用 getBoundingClientRect().width（手机 DPR/小数布局下为小数）。虚拟分层的 left=index*(virtualCellW+sb)
+  // 要与 Swiper 真实 slide 节距逐像素对齐；若 containerWidth 与 Swiper 的整数 width 有 δ 偏差，则每张累积
+  // δ/vm、序号越大越往右偏移（手机才测得出，桌面宽度为整数 δ=0 故无偏移）。
   useEffect(() => {
     if (!isOpen) return;
     const el = containerRef.current;
     if (!el) return;
     const update = () => {
-      const rect = el.getBoundingClientRect();
-      if (rect.width > 0) setContainerWidth(rect.width);
-      if (rect.height > 0) setContainerHeight(rect.height);
+      const w = el.offsetWidth;
+      const h = el.offsetHeight;
+      if (w > 0) setContainerWidth(w);
+      if (h > 0) setContainerHeight(h);
     };
     update();
     const observer = new ResizeObserver(update);
@@ -2700,6 +2879,62 @@ function SwiperLoopCarousel({
     const unsubs = [m.scale, m.x, m.y].map((mv) => mv.on("change", update));
     return () => unsubs.forEach((u) => u());
   }, [isOpen, realIndex]);
+
+  // ── "放大渐隐"（单/双/三图）：订阅活跃行全部图片 scale，取最大者（任一图达标即全隐）──
+  // 计算基准随模式切换：单图以整个视口、双图以 1/2 屏幕、三图以 1/3 屏幕（宽÷viewMode，高不变）
+  // 为基准格位；任一活跃图以最短边为基准放大到与格位一致（coverage=1，完全填满其格位）时，
+  // 周边 UI 与单图同样全部隐藏。只计缩放、不计拖拽（按居中计算）；基准尺寸（scale=1 的
+  // contain 渲染尺寸）优先取 img.width/height，缺失时从 DOM 主图 naturalWidth/Height 兜底
+  // （读 natural 尺寸不触发布局）；无尺寸信息的图不参与计算。纯 MotionValue 驱动零重渲染。
+  useEffect(() => {
+    if (!isOpen || n === 0) {
+      zoomUiOpacity.set(1);
+      return;
+    }
+    // 基准格位：宽度 = 视口宽 ÷ viewMode（双图 1/2、三图 1/3），高度 = 视口高
+    const refW = window.innerWidth / viewMode;
+    const refH = window.innerHeight;
+    // 图在布局中的实际格宽（与 Swiper slidesPerView/spaceBetween 一致：双/三图间隙 8、单图 2）
+    const cellW =
+      viewMode > 1
+        ? (containerWidth - (viewMode - 1) * 8) / viewMode
+        : containerWidth;
+    const apply = () => {
+      let minOp = 1;
+      for (let off = 0; off < viewMode; off++) {
+        const idx = (realIndex + off) % n;
+        const m = imageMotionsMapRef.current.get(idx);
+        const img = images[idx];
+        if (!m || !img) continue;
+        const s = m.scale.get();
+        if (s <= 1) continue; // 未放大 → 该图 op=1，不拉低全局
+        let nw = img.width;
+        let nh = img.height;
+        if (!nw || !nh) {
+          const el = document.querySelector(
+            `[data-img-index="${idx}"] [data-carousel-main-img]`
+          ) as HTMLImageElement | null;
+          if (el && el.naturalWidth > 0) {
+            nw = el.naturalWidth;
+            nh = el.naturalHeight;
+          }
+        }
+        if (!nw || !nh || cellW <= 0 || containerHeight <= 0) continue;
+        const base = computeContainedSize(nw, nh, cellW, containerHeight);
+        const op = computeZoomUiOpacity(s, base.w, base.h, refW, refH);
+        if (op < minOp) minOp = op;
+      }
+      zoomUiOpacity.set(minOp);
+    };
+    apply();
+    // 订阅活跃行每张图的 scale：任一变化都重取 min（事件频率与滚轮/双指 rAF 节流同步）
+    const unsubs: Array<() => void> = [];
+    for (let off = 0; off < viewMode; off++) {
+      const m = imageMotionsMapRef.current.get((realIndex + off) % n);
+      if (m) unsubs.push(m.scale.on("change", apply));
+    }
+    return () => unsubs.forEach((u) => u());
+  }, [isOpen, viewMode, realIndex, n, images, containerWidth, containerHeight, zoomUiOpacity]);
   const imgOverflowActive =
     isOpen &&
     (imgDraggingIdx != null ||
@@ -2708,8 +2943,9 @@ function SwiperLoopCarousel({
   const swiperContainerStyle = {
     // 外侧黑边固定 20px（上/左/右），画布内部宽度 = 视口宽 - 两侧黑边，随屏自适应；
     // 高度贴近屏幕（顶部留 20px 黑边、底部外扩 3px）；四角圆角由 overflow-hidden + borderRadius 裁切。
+    // 矮视口（手机横屏）紧凑模式：底部预留 140→96，把高度还给主图。
     width: `calc(100vw - ${CANVAS_EDGE_PX * 2}px)`,
-    height: `calc(100dvh - ${BOTTOM_RESERVED}px - ${CANVAS_EDGE_PX}px + 3px)`,
+    height: `calc(100dvh - ${compactStrip ? STRIP_BOTTOM_COMPACT : BOTTOM_RESERVED}px - ${CANVAS_EDGE_PX}px + 3px)`,
     borderRadius: 14,
     // style 覆盖 className 的 overflow-hidden：恒定放开裁剪，图片放大/位移溢出时始终从画布边缘"透图"到
     // 半透明框架层上（松手后不退回裁剪），形成一直可见的半透明边缘。
@@ -2728,6 +2964,10 @@ function SwiperLoopCarousel({
       initialLoadRef.current = true;
     }
   }, []);
+  // 对话框打开时预热一个 WebGL 上下文（池化首个），令首次删除也不承担上下文创建开销
+  useEffect(() => {
+    if (isOpen) warmupSuction();
+  }, [isOpen]);
   const handleSlideChange = useCallback((s: SwiperClass) => {
     if (s.destroyed) return;
     // canSlide 删除的 Swiper 复位期间：整体忽略 slideChange（slideToLoop 中间循环位会
@@ -2791,6 +3031,42 @@ function SwiperLoopCarousel({
     activeIndicesCacheRef.current = s;
     return s;
   }, [isOpen, realIndex, viewMode, n]);
+
+  // ── 邻图“落位后闪现上一张”修复（根因B：收口延迟） ──
+  // 实测：上一张（leaving card）在 400ms 飞出动画全程可见（正常），但停住后它的 18px 左边缘
+  // 残影要多停留 ~16ms（1~2 帧）才消失——因为它的隐藏依赖 isSwipeAnimating=false 触发的那次
+  // 全量重渲染提交，提交天然慢一帧以上。元素缓存已把它从 ~47ms 压到 ~16ms，但压不到 0。
+  // 修法：落位瞬间（transitionEnd）对“刚飞出的那一张”命令式立即写 visibility:hidden，抢在慢提交
+  // 之前抹掉残影。之所以这次不会重踏“永久卡死”：已让 innerDivStyle 对近活跃 slide 始终显式
+  // 写 visibility（见 renderSlideInner），React 完全接管了这个键——命令式写的值会在下一次 React
+  // 渲染时被正确值覆盖（该卡变回活跃时 React 会显式写 visible），命令式永远只是“提前量”，不可能残留。
+  const slideElMapRef = useRef<Map<number, HTMLElement>>(new Map());
+  // 用 ref 镜像判断所需的最新值，避免 handleSlideChangeTransitionEnd 被 Swiper 内部缓存为旧引用
+  // 时读到过期闭包（transitionEnd 是渲染提交之后的延迟事件，useEffect 同步不影响正确性）。
+  const neighborHideContextRef = useRef({ realIndex, n, viewMode, activeIndices, deletingId, isTransitioningViewMode });
+  useEffect(() => {
+    neighborHideContextRef.current = { realIndex, n, viewMode, activeIndices, deletingId, isTransitioningViewMode };
+  }, [realIndex, n, viewMode, activeIndices, deletingId, isTransitioningViewMode]);
+  const handleSlideChangeTransitionEnd = useCallback(() => {
+    const { realIndex: ri, n: nn, activeIndices: ai, deletingId: del, isTransitioningViewMode: transitioning } = neighborHideContextRef.current;
+    // 仅在“普通切换真正落位”（非删除/视图切换、且 Swiper 已不再 animating）时命令式收口。
+    // !animating 守卫很关键：连续/重叠切换时，被中断那次也会触发 transitionEnd，若那时就收口会把
+    // 仍在飞出的退场图截断。只有最后一次 transitionEnd（无后续过渡、animating=false）才收口。
+    if (del == null && !transitioning && nn > 0 && !swiperRef.current?.animating) {
+      // 动画期间为“保证退场图完整飞出”放行了整个近活跃窗口，落位后这些非活跃邻图（进入侧、退场
+      // 两侧都有）都要等 isSwipeAnimating=false 那次全量重渲染(~16ms)才隐藏，期间在视口左右边缘同时
+      // 闪现（点下一张时右侧邻居更贴近视口、闪得明显；点上一张则左侧明显）。这里对已挂载的全部
+      // 非活跃 slide（常数级 ~11 项，O(1)）即时写 hidden，一次性抹掉两侧残影。React 已全权接管 visibility：
+      // 这些卡稳态即 hidden（下次渲染同值），将来变活跃时 React 写 visible 恢复，不会卡死。
+      for (const [idx, el] of slideElMapRef.current) {
+        if (!ai.has(idx) && el.isConnected) el.style.visibility = "hidden";
+      }
+      // 真正落位：本轮退场动画已结束，复位退场起点为当前中心，使下一轮（含不经过 goToIndex 的拖拽
+      // 滑动）的 spanSlots 从当前中心重新累计——起点=当前中心时距离即新跨越槽数，语义与按钮切换一致。
+      retreatFromRef.current = ri;
+    }
+    setIsSwipeAnimating(false);
+  }, []);
 
   // 预计算 Swiper 渲染范围内的 idx 集合（active ± SWIPER_RENDER_RANGE），避免 map 内 440 次取模
   // 退出动画期间保留缓存
@@ -2860,6 +3136,17 @@ function SwiperLoopCarousel({
   }, [isOpen, images.length]);
 
   // 创建单个 slide 的内容（提取为函数，Virtual 和非 Virtual 模式共用）
+  //
+  // 性能：`slides` / `renderVirtualOverlaySlide` 两个 useMemo 只覆盖 nearActiveSet（约 11 张），
+  // 但 `renderSlideInner` 本身有 35 项依赖，任一依赖变化都会让这 11 张全部重建 JSX。
+  // 这里加一层按 `index + img.id` 分片的元素缓存：把该 slide 本次计算用到的全部输入值
+  // 收进一个签名单元组，与上次命中缓存时保存的签名逐项 Object.is 比较，完全一致则直接复用
+  // 上一次构造好的 `node`（React 对同一 element 引用会 bail out，跳过该子树 reconcile）。
+  // 只统计"渲染期读取到的值"，不改动任何视觉判断逻辑本身，因此命中/未命中的计算结果与原
+  // 实现逐字节一致；未命中（如发生删除重排，多数派生值本就会变）时按原路径重新构造 node。
+  const slideElementCacheRef = useRef<
+    Map<string, { sig: unknown[]; node: React.ReactElement; slideClassName: string; overflowClip: boolean }>
+  >(new Map());
   const renderSlideInner = useCallback((index: number) => {
     const img = images[index];
     // 全部删除后 overlay 关闭前的一瞬 n 可能为 0，或 %0 使 nearActiveSet 产生 NaN/Fractional 下标：
@@ -3022,10 +3309,14 @@ function SwiperLoopCarousel({
     // 承担（本卡同时是右侧 rider），故这里只驱动入场视觉(scale/opacity/entryX +0.6格→0)。
     // 重排后(realIndex+viewMode 下标已被后图占据)该卡自然不再命中，静置由 deleteFillTarget 接管。
     const deleteEntryTarget =
+      (!serialAnim || deleteMotionStarted) &&
+      (!serialAnim || viewMode > 1) &&
       isOpen &&
       !deletingReshapedRef.current &&
       deletedInActiveRow &&
       index === realIndex + viewMode;
+    // 单图+并行：新入图入场不淡入（直接不透明），避免半透明期透出下方不透明的吸入旧图 → 主体看不到新图。
+    const entryNoFade = !serialAnim && viewMode === 1 && deleteEntryTarget;
     // 该图当前是否被缩放/拖拽而贴到滑片边界。是则给图片施加边缘淡出遮罩，
     // 让贴边/即将被裁剪的部分呈现半透明软过渡，而非一条生硬的裁剪线。
     // 滑片仍保持 overflow-hidden，各图片不会拖进相邻图片。
@@ -3063,7 +3354,9 @@ function SwiperLoopCarousel({
     // 判定（右幸存图左移一格 → relIdx-1，与切换 next 落位一致）：随盒平移中始终裁剪到目标槽位，
     // 放大图多余的横向溢出不会越过中线漏到相邻卡。
     let movingClipPath: string | undefined;
-    if (rider && !devDisableSurvivorAnim) {
+    // 单图并行的“进入图”(deleteEntryTarget)不裁：它整格在屏幕右侧一屏外，groupShiftX 把图左移进中央，
+    // 若仍按自身盒裁切会把图裁死在右格里（只露一条缝）→ 必须放开才能飞进中央。
+    if (rider && !devDisableSurvivorAnim && !(viewMode === 1 && deleteEntryTarget)) {
       if (viewMode > 1) {
         const landRel = relIdx - 1; // 右幸存图左移一格后落位
         const landInRow = landRel < viewMode;
@@ -3095,16 +3388,46 @@ function SwiperLoopCarousel({
     // 例外四：删除窗口内"从右侧进入新末位的下一张图"（deleteEntryTarget）非活跃却要播放与切换
     //        相同的"缩放+淡入+飞入"，若被此处隐藏，其飞入全程不可见，重排后静置归位则表现为
     //        新图"直接出现"而非飞入。故删除期间放行它，保证飞入可见。
+    // 例外三（精准放行 + 动态 span）：普通滑动过渡中（isSwipeAnimating）只放行“飞入主体(active) +
+    // 退场侧正在飞出的若干张”，隐藏进入侧远邻与更外侧邻居——否则它们静止位就压着视口左右边缘（单图约
+    // 露 17~18px），动画起止段会露头、到落位才收口，视觉上即“切换前/后左右闪一下”（点下一张右侧进入邻居
+    // 更贴边、闪得明显；点上一张则左侧）。退场侧=飞行反方向：dir=1 内容左移→退场在左(relIdx 接近 n)、
+    // dir=-1 内容右移→退场在右(relIdx 接近 viewMode)。放行张数不再是固定值，而是等于“本轮动画从最初
+    // 起点(retreatFromRef)到当前中心实际跨越的槽数”（上限 RETREAT_MAX）：单次切换 span=1 → 只放行真正
+    // 的退场图，消除相邻远邻(如 relIdx n-2)贴视口边缘的露头闪现；连续/重叠点击 span 自动累加 → 覆盖所有
+    // 仍在飞出的退场图、不截断退场动画；远距离跳转按上限收敛，与既有固定窗口行为一致。落位后残留再由
+    // handleSlideChangeTransitionEnd 命令式即时收口兜底。
+    const RETREAT_MAX = 4;
+    const spanFrom = retreatFromRef.current;
+    let spanSlots = 1;
+    if (spanFrom >= 0 && n > 0) {
+      const rawSpan =
+        slideDirectionRef.current === -1
+          ? ((spanFrom - realIndex) % n + n) % n
+          : ((realIndex - spanFrom) % n + n) % n;
+      spanSlots = Math.min(Math.max(rawSpan, 1), RETREAT_MAX);
+    }
+    const onRetreatSide =
+      slideDirectionRef.current === -1
+        ? relIdx >= viewMode && relIdx < viewMode + spanSlots
+        : relIdx >= n - spanSlots;
+    const swipeKeepVisible = isActive || onRetreatSide;
+    // 退场放行卡（动画期间为“看到旧图飞出”而保持可见的非活跃邻图）：它最终停在“左/右邻静止
+    // 位”，单图下右/左缘会露出 ~18px。收口靠 Swiper transitionEnd 事件，该事件比“视觉到位”晚约 1 帧，
+    // 造成“动画结束后贴边一条旧图闪现”（进入侧靠 neighborHidden 即时隐藏无此问题，只有退场放行侧）。
+    // 解法：给这些退场放行卡的内层图片(opacity 动画层)一个“贴边淡出”过渡——ease 后段起步慢，前 ~200ms
+    // （仍在中心区、真正在飞出）近乎不透明保持可见，接近贴边(220-400ms)才淡到 0，先于 transitionEnd 收口
+    // 消除那 1 帧实心残影。纯 CSS 过渡、不新增每帧 JS；空闲/非退场态不写 opacity，稳态与原来逐位一致。
+    const isRetreatFading = !isActive && isSwipeAnimating && !isTransitioningViewMode && onRetreatSide && !deleteEntryTarget;
     const neighborHidden =
       !isActive &&
-      lastDeletedIndexRef.current !== index &&
+      (lastDeletedIndexRef.current !== index || deletingReshapedRef.current) &&
       !deleteEntryTarget &&
       (
-        // 缩放/拖拽溢出时隐藏非活跃邻图（防其从半透明框架漏出）。但在视图切换过渡中
-        // 必须放行"正在退出/进入"的邻图——否则被放大图的存在（imgOverflowActive=true）
-        // 会在过渡一开始就把第二张等邻图瞬间隐藏，导致它们"直接消失、无退出动画"。
-        (!isTransitioningViewMode && !isSwipeAnimating && imgOverflowActive) ||
+        // 空闲（非视图切换、非滑动动画）：隐藏非活跃邻图。
         (!isTransitioningViewMode && !isSwipeAnimating) ||
+        // 滑动动画中：放行飞入主体与退场侧，隐藏其余（进入侧远邻等），消除贴边闪现。
+        (!isTransitioningViewMode && isSwipeAnimating && !swipeKeepVisible) ||
         // 视图切换过渡中（单图→双图/三图、双图→三图等"变多"方向）：隐藏"新布局之外、与动画无关"
         // 的非活跃邻图，防止它们从半透明框架/屏幕边缘漏出（容器/Swiper 恒 overflow:visible）。
         // 但放行正在退出的图（isExitingOnViewModeChange，双图/三图→单图 时需可见以播放退出动画），
@@ -3116,8 +3439,20 @@ function SwiperLoopCarousel({
       // overflow 全 visible（横/纵都能溢出透出），横向是否被裁完全交给上面的 clip-path
       overflow: "visible",
       ...(horizontalClip ? { clipPath: horizontalClip, WebkitClipPath: horizontalClip } : {}),
-      // neighborHidden（过渡期隐藏无关邻图）或 Dev"隐藏主图"（visibility 保留布局，仅不可见）
-      ...(neighborHidden || devHideMainImage ? { visibility: "hidden" } : {}),
+      // 始终显式写 visibility（不再"该隐藏才写、可见时省略该键"）：让 React 完全接管这个键，
+      // 从而使 handleSlideChangeTransitionEnd 里对 leaving card 的命令式 visibility:hidden 只是
+      // "提前量"，下一次 React 渲染必被正确值覆盖（该卡变回活跃时写 visible），杜绝命令式写入
+      // 落入 React style-diff 盲区而永久残留的历史卡死问题。视觉结果与原来逐位一致（未写=visible 与显式 visible 相同）。
+      visibility: neighborHidden || devHideMainImage ? "hidden" : "visible",
+      // 退场放行卡的贴边淡出（见上方 isRetreatFading 注释）：只作用于“动画期间被放行的退场侧非活跃卡”。
+      // 放在本外壳层：内层图片(motion.div/AnimatedSlideImg)的 opacity 动画带更高优先级 inline opacity 与
+      // !important，外壳 opacity 作为祖先仍能乘算生效；非退场态不写这两属性，稳态零变化、不影响其它动画。
+      // delay 240ms：飞出前 ~240ms（离中心、仍在大幅滑行的主段）完全不透明，保证“旧图滑出”观感不被削弱；
+      // 之后 110ms 线性淡到 0，在卡片贴边静止(总时长~400ms)前约 2~3 帧就归零，早于 transitionEnd 收口，
+      // 消除贴边实心残影。
+      ...(isRetreatFading
+        ? { opacity: 0, transition: "opacity 110ms linear 240ms" }
+        : {}),
     };
     // 该滑片内容（图片+motion）与滑片外壳(overflow 裁剪)拆分：
     // - 非虚拟(小 n)：外壳 = SwiperSlide，内容放其内部
@@ -3126,11 +3461,52 @@ function SwiperLoopCarousel({
     // 用订阅式 imgOverflowActive（真实监听 scale/x/y 变化并触发重渲染）而非渲染期读
     // motionsNow.scale.get()（滚轮缩放只改 motion 值不触发重渲染，会停留在旧值 → 必须拖一次才透图）。
     // 单图模式下可见滑片即 realIndex，imgOverflowActive 恰反映它，故可直接使用。
-    const overflowClip = viewMode === 1 && !isTransitioningViewMode && !imgOverflowActive;
+    const overflowClip = viewMode === 1 && !isTransitioningViewMode && !imgOverflowActive && !deleteEntryTarget;
     const slideClassName = `!flex h-full min-h-0 items-center justify-center${overflowClip ? " !overflow-hidden" : ""}`;
+    // ── 按 slide 分片的元素缓存：把本次用到的全部输入值收进一个签名单元组 ──
+    const cacheKey = `${index}-${img.id}`;
+    const sig: unknown[] = [
+      // 与"这张图本身"相关的输入
+      img.id, img.thumbSrc, img.src, img.alt, img.dimensions, img.width, img.height, img.sizeLabel, img.fileSize,
+      renamedMapRef.current.get(img.id) ?? img.alt,
+      // 由 preloader / 加载态派生
+      readySrc, displaySrc, thumbReady, showSpinner, progressKnown, downloadProgress,
+      // 视图模式切换 / 缩放补偿相关
+      relIdx, prevVM, newVM, entryXFrom, entryScaleFrom, isExitingOnViewModeChange, viewModeZIndex,
+      // 活跃/行列归属 / 隐藏判定
+      isActive, wasActiveMap.get(index), deletedInActiveRow, groupShiftOn, rider, deleteShiftActive,
+      deleteFillTarget, fillSettledAt, deleteSurvivorFillTarget, survivorSettledAt,
+      deleteEntryTarget, entryNoFade, imgOverflowing, isFirstInRow, isLastInRow, inRow,
+      horizontalClip, movingClipPath, neighborHidden, isRetreatFading, overflowClip, slideClassName, deleteTranslateX,
+      // 直接透传给子组件的 motion / ref（对象身份，非读取 .get()，MotionValue 本身稳定则不触发失效）
+      motionsNow, groupShiftX,
+      // 闭包内直接捕获进 JSX 的组件级 state/props/ref（身份变化必须使缓存失效）
+      n, realIndex, containerWidth, containerHeight, isTransitioningViewMode, isSwipeAnimating, isPinching,
+      viewModeEpoch, slideDirectionRef, activeIndices.size, preloader.version,
+      deletingId, deletingReshapedRef.current, deleteMotionStarted, serialAnim,
+      lastDeletedIndexRef.current, imgDraggingIdx, imgOverflowActive,
+      // 内联进 JSX 作为闭包引用的函数/数组（onExitComplete/onDragStart/onDownload/onClick 等捕获了本次渲染的
+      // 这些引用，若不复位为最新值，命中缓存时会调用到旧闭包）
+      renderOverlay, onDownload, actionsConfig, flyOutAndRemove, startRename, onThumbLoaded,
+      renameSeq, devHideMainImage, devDisableSurvivorAnim, totalCount,
+    ];
+    const cached = slideElementCacheRef.current.get(cacheKey);
+    if (
+      cached &&
+      cached.sig.length === sig.length &&
+      cached.sig.every((v, i) => Object.is(v, sig[i]))
+    ) {
+      return { node: cached.node, slideClassName: cached.slideClassName, overflowClip: cached.overflowClip };
+    }
     const node: React.ReactElement = (
         <div
           data-img-index={index}
+          ref={(el) => {
+            // 登记当前已挂载的 slide 根节点，供 handleSlideChangeTransitionEnd 命令式收口用。
+            // cacheKey 已含 index，缓存命中复用的 node 携带的也是当初同一个 index 闭包，不会串位。
+            if (el) slideElMapRef.current.set(index, el);
+            else slideElMapRef.current.delete(index);
+          }}
           className="relative flex h-full min-h-0 w-full items-center justify-center"
           style={innerDivStyle}
         >
@@ -3167,9 +3543,14 @@ function SwiperLoopCarousel({
               src={displaySrc}
               underlaySrc={img.thumbSrc}
               alt=""
+              zoomScale={motionsNow.scale}
               isActive={isActive}
               wasActive={wasActiveMap.get(index)}
-              loading={index === realIndex ? "eager" : "lazy"}
+              // 删除窗口内"从右侧进入的新图"（deleteEntryTarget）会被驱动同步飞入主图位置，
+              // 但它未激活、处于视口右缘之外，loading=lazy 会因"不在视口内"而不发起加载 → 飞入全程
+              // 无内容（空白），结束后才重新请求 → "直接出现"。故删除入场的新图强制 eager，让它在
+              // 飞入的 0.4s 内尽早用缩略图/分块就绪，可见地滑入（同时与删除动画并行）。
+              loading={index === realIndex || deleteEntryTarget ? "eager" : "lazy"}
               showSpinner={showSpinner}
               downloadProgress={downloadProgress}
               progressKnown={progressKnown}
@@ -3198,6 +3579,7 @@ function SwiperLoopCarousel({
               deleteFillTarget={deleteFillTarget}
               deleteFillSettledAt={fillSettledAt}
               deleteEntryTarget={deleteEntryTarget}
+              entryNoFade={entryNoFade}
               deleteTranslateX={deleteTranslateX}
               groupShiftX={rider ? groupShiftX : undefined}
               groupShiftScaleX={rider ? motionsNow.scale : undefined}
@@ -3224,7 +3606,7 @@ function SwiperLoopCarousel({
           {isActive && deletingId !== img.id && (
             <motion.div
               className="pointer-events-none absolute left-3 top-[calc(56px-20px)] z-10 flex items-center gap-3"
-              style={{ x: rider ? groupShiftX : 0, willChange: "transform" }}
+              style={{ x: rider ? groupShiftX : 0, willChange: "transform", opacity: zoomUiOpacity }}
             >
               {/* 名称栏：序号 / 名称 / 尺寸 / 大小。与操作按钮分开，单独成栏。幸存图重排重挂载时跳过入场淡入 */}
               <motion.div
@@ -3305,8 +3687,12 @@ function SwiperLoopCarousel({
           )}
         </div>
     );
+    // 写入缓存；cache 以 index+img.id 为键，连续翻页/大量重排时 key 会随窗口移动不断新增，
+    // 超过阈值直接清空（nearActiveSet 窗口很小，少量重建不构成实际开销，仅防止长期驻留）。
+    if (slideElementCacheRef.current.size > 64) slideElementCacheRef.current.clear();
+    slideElementCacheRef.current.set(cacheKey, { sig, node, slideClassName, overflowClip });
     return { node, slideClassName, overflowClip };
-  }, [images, realIndex, n, prevViewMode, viewMode, isTransitioningViewMode, isSwipeAnimating, containerWidth, containerHeight, preloader, preloader.version, isPinching, activeIndices, wasActiveMap, viewModeEpoch, slideDirectionRef, getOrCreateImageMotions, renderOverlay, onDownload, imgDraggingIdx, imgOverflowActive, actionsConfig, flyOutAndRemove, startRename, deletingId, renamedMapRef, renameSeq, deletingReshapedRef, onThumbLoaded, devHideMainImage, devDisableSurvivorAnim]);
+  }, [images, realIndex, n, prevViewMode, viewMode, isTransitioningViewMode, isSwipeAnimating, containerWidth, containerHeight, preloader, preloader.version, isPinching, activeIndices, wasActiveMap, viewModeEpoch, slideDirectionRef, getOrCreateImageMotions, renderOverlay, onDownload, imgDraggingIdx, imgOverflowActive, actionsConfig, flyOutAndRemove, startRename, deletingId, renamedMapRef, renameSeq, deletingReshapedRef, onThumbLoaded, devHideMainImage, devDisableSurvivorAnim, deleteMotionStarted, serialAnim]);
 
   // 非虚拟(<n)：内容包回 SwiperSlide，行为与原来完全一致
   const renderSlideContent = useCallback((index: number) => {
@@ -3405,7 +3791,7 @@ function SwiperLoopCarousel({
     const endIdx = Math.min(n - 1, centerIdx + range);
     const thumbActiveTarget = isKeyboardActive ? pendingRealIndex : realIndex;
     const activeScale = isKeyboardActive ? 1 : (viewMode === 1 ? CENTER_SCALE : viewMode === 2 ? 1.15 : 1.1);
-    const stripHeight = viewMode === 1 ? HIGHLIGHT_CENTER_WIDTH : CENTER_THUMB_SIZE;
+    const stripHeight = STRIP_ROW_HEIGHT;
     const cache = stripItemCacheRef.current;
     const newPositions = new Map<number, number>();
     const items = [];
@@ -3429,7 +3815,13 @@ function SwiperLoopCarousel({
       // 不再"先平移到位再按高亮间距二次调整"（现状第二张差 6px 重排时再补位）。
       const finalIdx = bindShift ? i - 1 : i;
       const finalActive = finalIdx >= thumbActiveTarget && finalIdx < thumbActiveTarget + viewMode;
-      const extraLeft = viewMode === 2 && finalActive && finalIdx === thumbActiveTarget + 1 ? DUAL_HIGHLIGHT_EXTRA_GAP : 0;
+      // 双图高亮的额外间距对称分配：左中心图 -EXTRA/2、右中心图 +EXTRA/2。使两张中心图与左右邻缩略图
+      // 的外侧间距相等（否则原实现仅右中心图 +EXTRA 会使右外侧间距被压缩、甚至与右邻重叠）。
+      let extraLeft = 0;
+      if (viewMode === 2 && finalActive) {
+        if (finalIdx === thumbActiveTarget) extraLeft = -DUAL_HIGHLIGHT_EXTRA_GAP / 2;
+        else if (finalIdx === thumbActiveTarget + 1) extraLeft = DUAL_HIGHLIGHT_EXTRA_GAP / 2;
+      }
       const offsetX = i * thumbPitch + extraLeft;
       const oldOffsetX = thumbPositionsRef.current.get(img.id);
       // 删除后索引重排：此项从 oldOffsetX 移到新 offsetX，差值作为挂载动画起点（FLIP 靠拢）
@@ -3554,10 +3946,13 @@ function SwiperLoopCarousel({
             </div>
           )}
 
+          {/* 吸入层容器：isolation:isolate 强制本容器为层叠上下文 → 吸入层 z-index:-1 稳定落在
+              “容器背景之上、所有卡片之下”：旧 DOM 图 opacity0 透明→吸入透出；进入卡不透明→盖其上。
+              不改任何卡片 position/z（避免破坏入场 motion）。 */}
           <div
             ref={containerRef}
             className="relative flex items-center justify-center overflow-hidden"
-            style={swiperContainerStyle}
+            style={{ ...swiperContainerStyle, isolation: "isolate" }}
             onTouchStart={handleTouchStart}
             onTouchMove={handleTouchMove}
             onTouchEnd={handleTouchEnd}
@@ -3574,7 +3969,7 @@ function SwiperLoopCarousel({
               onSwiper={handleSwiperInit}
               onSlideChange={handleSlideChange}
               onSlideChangeTransitionStart={() => setIsSwipeAnimating(true)}
-              onSlideChangeTransitionEnd={() => setIsSwipeAnimating(false)}
+              onSlideChangeTransitionEnd={handleSlideChangeTransitionEnd}
               className={`absolute inset-0 h-full w-full${isTransitioningViewMode ? " !overflow-visible" : ""}`}
               wrapperClass="swiper-wrapper h-full min-h-0"
               style={
@@ -3602,19 +3997,21 @@ function SwiperLoopCarousel({
             )}
 
             {/* 半透明"框架"边缘层：图片不做裁切，溢出部分被此半透明框覆盖而呈半透明，形成清晰边界。
-              恒定渲染（容器 overflow 恒 visible），使半透明边缘/透图一直可见而非仅在拖拽缩放时出现。 */}
-            <div
+              恒定渲染（容器 overflow 恒 visible），使半透明边缘/透图一直可见而非仅在拖拽缩放时出现。
+              单图放大渐隐：框架半透明层随周边 UI 一同变透（用户规格："包括框架的黑色半透明"）。 */}
+            <motion.div
               className="pointer-events-none absolute inset-0 z-[5]"
-              style={{ borderRadius: 14, boxShadow: "0 0 0 9999px var(--car-frame)" }}
+              style={{ borderRadius: 14, boxShadow: "0 0 0 9999px var(--car-frame)", opacity: zoomUiOpacity }}
             />
           </div>
 
-          {/* Dev 调试控制面板：仅非生产构建渲染，生产构建整段被 DCE 排除，零运行时开销 */}
-          {isDev && (
-            <div
+          {/* Dev 调试控制面板：仅 debugPanel 显式开启且非生产构建时渲染。外部引用默认 debugPanel=false → 面板不出现。
+              它也是盖在图片上的半透明黑层，随单图放大渐隐一同淡出（生产构建此 JSX 整体 DCE，零开销） */}
+          {isDev && debugPanel && (
+            <motion.div
               className="absolute top-16 right-16 z-[60] select-none"
               onClick={(e) => e.stopPropagation()}
-              style={{ fontFamily: "ui-monospace, SFMono-Regular, monospace" }}
+              style={{ fontFamily: "ui-monospace, SFMono-Regular, monospace", opacity: zoomUiOpacity }}
             >
               <button
                 onClick={() => setDevPanelOpen((o) => !o)}
@@ -3643,10 +4040,13 @@ function SwiperLoopCarousel({
                 >
                   <div className="mb-0.5 text-[11px] font-bold uppercase tracking-wider opacity-70">调试开关</div>
                   {[
+                    { key: "deleteMode", label: "串行删除（吸入后再切换）", value: serialAnim, set: (v: boolean) => setDevSerialOverride(v) },
                     { key: "devHideThumbs", label: "隐藏底部缩略图条", value: devHideThumbs, set: setDevHideThumbs },
                     { key: "devDisableDeleteAnim", label: "关闭被删除图片动画", value: devDisableDeleteAnim, set: setDevDisableDeleteAnim },
                     { key: "devDisableSurvivorAnim", label: "关闭幸存图补位动画", value: devDisableSurvivorAnim, set: setDevDisableSurvivorAnim },
                     { key: "devHideMainImage", label: "隐藏主图", value: devHideMainImage, set: setDevHideMainImage },
+                    { key: "devDisableSuctionPool", label: "关闭吸入上下文池(A/B)", value: devDisableSuctionPool, set: setDevDisableSuctionPool },
+                    { key: "devSuctionFullRes", label: "吸入用满分辨率(关L1)", value: devSuctionFullRes, set: setDevSuctionFullRes },
                   ].map(({ key, label, value, set }) => (
                     <label
                       key={key}
@@ -3664,7 +4064,7 @@ function SwiperLoopCarousel({
                   ))}
                 </div>
               )}
-            </div>
+            </motion.div>
           )}
 
           {extraOverlayContent && isOpen && extraOverlayContent({ image: images[realIndex], index: realIndex, total: totalCount, isActive: true })}
@@ -3676,10 +4076,10 @@ function SwiperLoopCarousel({
             // 居中容器负责屏幕正中央定位（motion 的 transform 会覆盖 Tailwind 的 -translate-x-1/2，
             // 因此水平/垂直居中放在此静态容器上，内层 motion 只做入场 y 动画，保证面板真正居中且可点击）。
             return (
-              <div
+              <motion.div
                 className="pointer-events-auto fixed left-1/2 top-1/2 z-[70] -translate-x-1/2 -translate-y-1/2"
                 // 显式 z-index：Tailwind arbitrary 类（z-[70]）可能未被打包，会导致面板按 DOM 顺序落到图片下方
-                style={{ zIndex: 9999 }}
+                style={{ zIndex: 9999, opacity: zoomUiOpacity }}
               >
                 <motion.div
                   initial={{ y: -10, opacity: 0 }}
@@ -3723,17 +4123,32 @@ function SwiperLoopCarousel({
                   {t.renameCancel}
                 </button>
                 </motion.div>
-              </div>
+              </motion.div>
             );
           })()}
 
-          <div className={`flex justify-center w-full ${devHideThumbs ? "hidden" : ""}`} onClick={(e) => e.stopPropagation()}>
+          {/* 缩略图条流容器：矮视口（手机横屏）紧凑模式下整体 0.72 缩放并压缩流高（内部尺寸/逻辑不变），
+              配合画布高度的底部预留 140→96，主图区域明显变大；电脑/平板/竖屏高度充足，不触发。 */}
+          <motion.div
+            className={`flex justify-center w-full ${devHideThumbs ? "hidden" : ""}`}
+            style={{
+              opacity: zoomUiOpacity,
+              ...(compactStrip
+                ? {
+                    height: Math.round((STRIP_ROW_HEIGHT + 17) * STRIP_COMPACT_SCALE),
+                    transform: `scale(${STRIP_COMPACT_SCALE})`,
+                    transformOrigin: "top center",
+                  }
+                : {}),
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
             <motion.div
               ref={stripWheelRef}
               className={`relative z-[60] mt-[17px] shrink-0 overflow-hidden ${isStripDragging && dragMoved ? "cursor-grabbing" : "cursor-grab"}`}
               style={{
                 width: STRIP_BASE_WIDTH,
-                height: viewMode === 1 ? HIGHLIGHT_CENTER_WIDTH : CENTER_THUMB_SIZE,
+                height: STRIP_ROW_HEIGHT,
                 clipPath:
                   STRIP_VISIBLE_COUNT === STRIP_DRAG_VISIBLE
                     ? "inset(0 0 0 0)"
@@ -3753,7 +4168,7 @@ function SwiperLoopCarousel({
                   // 容器宽度从 n*64px 降至 ~41*64px ≈ 2624px，大幅减少合成层面积
                   x: stripX,
                   width: (stripItems.items.length + 1) * (THUMB_SIZE + THUMB_GAP),
-                  height: viewMode === 1 ? HIGHLIGHT_CENTER_WIDTH : CENTER_THUMB_SIZE,
+                  height: STRIP_ROW_HEIGHT,
                   touchAction: "pan-y",
                 }}
               >
@@ -3767,7 +4182,7 @@ function SwiperLoopCarousel({
                 transition={{ type: "spring", stiffness: 380, damping: 30, mass: 0.8 }}
               />
             </motion.div>
-          </div>
+          </motion.div>
 
           {renderToolbar ? (
             <div onClick={(e) => e.stopPropagation()}>
@@ -3789,14 +4204,14 @@ function SwiperLoopCarousel({
           <>
           <div className="pointer-events-none fixed top-5 left-0 right-0 z-30 flex items-center" onClick={(e) => e.stopPropagation()}>
             <div className="flex-1" />
-            <div className="pointer-events-auto">
+            <motion.div className="pointer-events-auto" style={{ opacity: zoomUiOpacity }}>
               <HintBar
                 isOpen={isOpen}
                 hintLabel={t.hint}
                 hintZoomDesktop={t.hintZoomDesktop}
                 hintZoomMobile={t.hintZoomMobile}
               />
-            </div>
+            </motion.div>
             <div className="flex-1 flex items-center justify-end gap-2" style={{ paddingRight: "calc((64px - 28px) / 2)" }}>
               {extraToolbarItems}
               <button
@@ -3813,10 +4228,34 @@ function SwiperLoopCarousel({
             </div>
           </div>
 
+          {/* 全屏按钮：位于关闭按钮正下方（同右偏 18px 对齐），y 轴对齐名称栏（视口 56px）；
+              样式参照关闭按钮（car__ctrl 圆钮 + 同款 tooltip）；图标随全屏态切换。 */}
+          <button
+            onClick={(e) => { e.stopPropagation(); toggleFullscreen(); }}
+            className="fixed top-[56px] z-40 inline-flex h-7 w-7 items-center justify-center rounded-full car__ctrl sm:backdrop-blur-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--car-ring)] group"
+            style={{ right: "calc((64px - 28px) / 2)" }}
+            aria-label={isFullscreen ? t.exitFullscreen : t.fullscreen}
+          >
+            {isFullscreen ? (
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M6 2v4H2 M10 2v4h4 M10 14v-4h4 M6 14v-4H2" />
+              </svg>
+            ) : (
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M2 6V2h4 M10 2h4v4 M14 10v4h-4 M6 14H2v-4" />
+              </svg>
+            )}
+            <span className="absolute top-full mt-2 left-1/2 -translate-x-1/2 whitespace-nowrap rounded-md car__tooltip px-2.5 py-1.5 text-xs opacity-0 transition-opacity group-hover:opacity-100 pointer-events-none shadow-lg backdrop-blur-sm z-50">
+              {isFullscreen ? t.exitFullscreen : t.fullscreen}
+              <span className="absolute bottom-full left-1/2 -translate-x-1/2 border-[5px] border-transparent border-b-black/80" />
+            </span>
+          </button>
+
           {n > 1 && (
             <>
-              <button
+              <motion.button
                 type="button"
+                style={{ opacity: zoomUiOpacity }}
                 onPointerDown={isNavigationLocked ? undefined : (e) => handleButtonPress(e, "left")}
                 onPointerUp={isNavigationLocked ? undefined : (e) => handleButtonRelease(e)}
                 onPointerCancel={isNavigationLocked ? undefined : (e) => handleButtonRelease(e)}
@@ -3826,8 +4265,8 @@ function SwiperLoopCarousel({
                 aria-label={t.prev}
               >
                 <span
-                  className="flex h-10 w-10 items-center justify-center rounded-full text-lg sm:backdrop-blur-sm"
-                  style={{ backgroundColor: themeTokens.arrowBg, color: themeTokens.arrowText }}
+                  className="flex h-10 w-10 items-center justify-center text-2xl font-medium"
+                  style={{ color: themeTokens.arrowText, textShadow: "0 1px 8px rgba(0,0,0,0.55)" }}
                   aria-hidden="true"
                 >
                   ‹
@@ -3836,10 +4275,11 @@ function SwiperLoopCarousel({
                   {t.prev}
                   <span className="absolute right-full top-1/2 -translate-y-1/2 border-[5px] border-transparent border-r-black/80" />
                 </span>
-              </button>
+              </motion.button>
 
-              <div
+              <motion.div
                 className="fixed right-0 top-0 z-20 h-full w-16"
+                style={{ opacity: zoomUiOpacity }}
                 onClick={(e) => e.stopPropagation()}
               >
                 {/* 居中箭头 — 与左侧 ‹ 按钮对齐方式一致 */}
@@ -3854,8 +4294,8 @@ function SwiperLoopCarousel({
                 >
                   <div className="pointer-events-none flex h-full w-full items-center justify-center">
                     <span
-                      className="flex h-10 w-10 items-center justify-center rounded-full text-lg sm:backdrop-blur-sm"
-                  style={{ backgroundColor: themeTokens.arrowBg, color: themeTokens.arrowText }}
+                      className="flex h-10 w-10 items-center justify-center text-2xl font-medium"
+                  style={{ color: themeTokens.arrowText, textShadow: "0 1px 8px rgba(0,0,0,0.55)" }}
                       aria-hidden="true"
                     >
                   ›
@@ -3867,8 +4307,10 @@ function SwiperLoopCarousel({
                   </span>
                 </div>
 
+                {/* 右下角设置菜单：能盛放双图（宽高比 > 1）才出现（取代原固定 lg 断点） */}
+                {canFitDual && (
                 <div
-                  className="absolute bottom-6 left-1/2 z-10 -translate-x-1/2 hidden lg:flex w-[56px] flex-col items-stretch rounded-2xl p-1 sm:backdrop-blur-sm gap-1"
+                  className="absolute bottom-6 left-1/2 z-10 -translate-x-1/2 flex w-[56px] flex-col items-stretch rounded-2xl p-1 sm:backdrop-blur-sm gap-1"
                   style={{
                     backgroundColor: themeTokens.shellBg,
                     "--car-title": themeTokens.titleText,
@@ -3878,6 +4320,11 @@ function SwiperLoopCarousel({
                     "--car-pill": themeTokens.activePill,
                     "--car-sep": themeTokens.separator,
                     ...(isStripDragging ? { pointerEvents: 'none' } : {}),
+                    // 矮视口（手机横屏）紧凑：与缩略图条同步 0.72 缩放（含弹出子菜单），
+                    // inline transform 覆盖 class 的 -translate-x-1/2 故需同写；origin bottom 保持底部锚定。
+                    ...(compactStrip
+                      ? { transform: "translateX(-50%) scale(0.72)", transformOrigin: "bottom center" }
+                      : {}),
                   } as React.CSSProperties}
                   onPointerDown={(e) => e.stopPropagation()}
                   onPointerUp={(e) => e.stopPropagation()}
@@ -3910,6 +4357,8 @@ function SwiperLoopCarousel({
                           className="absolute right-full mr-2 top-0 flex flex-col items-stretch rounded-xl p-0.5 shadow-lg backdrop-blur-sm z-50 gap-px" style={{ minWidth: 56, backgroundColor: themeTokens.dropdownBg }}
                         >
                           {([1, 2, 3] as const).map((mode) => {
+                            // 盛放不下三图时"三图"选项整个不出现（非置灰）：比例足够才可见
+                            if (mode === 3 && !canFitTriple) return null;
                             const isActive = viewMode === mode;
                             const cfg = VIEW_MODE_CONFIG[mode];
                             const isDisabled = (n < 2 && mode >= 2) || (n < 3 && mode >= 3);
@@ -4063,7 +4512,8 @@ function SwiperLoopCarousel({
                     </AnimatePresence>
                   </div>
                 </div>
-              </div>
+                )}
+              </motion.div>
             </>
           )}
           </>
@@ -4100,6 +4550,8 @@ export default function SwiperLoopCarouselWithErrorBoundary({
   useCache,
   maxCache,
   theme = "dark",
+  deleteMode,
+  debugPanel,
 }: {
   images: GalleryImage[];
   onNeedMore?: () => void;
@@ -4158,10 +4610,14 @@ export default function SwiperLoopCarouselWithErrorBoundary({
   maxCache?: number;
   /** 整体配色主题："dark"（默认）或 "light"（亮色）。调用方可按需切换 */
   theme?: CarouselTheme;
+  /** 多图删除动画时序："parallel"（默认）/ "serial" */
+  deleteMode?: "serial" | "parallel";
+  /** 是否显示 Dev 调试面板（默认 false，外部引用不出现） */
+  debugPanel?: boolean;
 }) {
   return (
     <CarouselErrorBoundary>
-      <SwiperLoopCarousel images={images} onNeedMore={onNeedMore} hasMore={hasMore} renderOverlay={renderOverlay} renderToolbar={renderToolbar} extraToolbarItems={extraToolbarItems} extraOverlayContent={extraOverlayContent} isOpen={isOpen} initialIndex={initialIndex} onClose={onClose} onDownload={onDownload} total={total} persistSettings={persistSettings} actions={actions} renameInputClassName={renameInputClassName} enableConcurrent={enableConcurrent} concurrency={concurrency} minChunkBytes={minChunkBytes} connectRetryMs={connectRetryMs} enableConnectRetry={enableConnectRetry} maxActiveImages={maxActiveImages} preloadRange={preloadRange} useCache={useCache} maxCache={maxCache} theme={theme} />
+      <SwiperLoopCarousel images={images} onNeedMore={onNeedMore} hasMore={hasMore} renderOverlay={renderOverlay} renderToolbar={renderToolbar} extraToolbarItems={extraToolbarItems} extraOverlayContent={extraOverlayContent} isOpen={isOpen} initialIndex={initialIndex} onClose={onClose} onDownload={onDownload} total={total} persistSettings={persistSettings} actions={actions} renameInputClassName={renameInputClassName} enableConcurrent={enableConcurrent} concurrency={concurrency} minChunkBytes={minChunkBytes} connectRetryMs={connectRetryMs} enableConnectRetry={enableConnectRetry} maxActiveImages={maxActiveImages} preloadRange={preloadRange} useCache={useCache} maxCache={maxCache} theme={theme} deleteMode={deleteMode} debugPanel={debugPanel} />
     </CarouselErrorBoundary>
   );
 }

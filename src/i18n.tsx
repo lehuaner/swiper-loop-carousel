@@ -14,6 +14,8 @@ export type CarouselI18nKey =
   | "viewMode2"
   | "viewMode3"
   | "close"
+  | "fullscreen"
+  | "exitFullscreen"
   | "dialogLabel"
   | "prev"
   | "next"
@@ -46,6 +48,8 @@ const defaultZh: CarouselI18nStrings = {
   viewMode2: "双图",
   viewMode3: "三图",
   close: "关闭",
+  fullscreen: "全屏",
+  exitFullscreen: "退出全屏",
   dialogLabel: "图片预览",
   prev: "上一张",
   next: "下一张",
@@ -75,6 +79,8 @@ const defaultEn: CarouselI18nStrings = {
   viewMode2: "2 PIC",
   viewMode3: "3 PIC",
   close: "Close",
+  fullscreen: "Fullscreen",
+  exitFullscreen: "Exit fullscreen",
   dialogLabel: "Image preview",
   prev: "Previous",
   next: "Next",

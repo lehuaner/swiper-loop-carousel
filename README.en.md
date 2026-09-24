@@ -41,6 +41,10 @@ A Swiper-based infinite loop carousel component with thumbnail drag navigation, 
 - **Concurrent Chunked Preloading** - Splits each full-size image into parallel segments via `fetch` + `Range` to break single-connection QoS throttling, with automatic degradation when unsupported
 - **TTFB Timeout Retry** - Automatically re-requests a chunk when the server response exceeds the threshold; a ring shows the real download percentage (same ring spins when total size is unknown)
 - **Theme Switching** - `dark` / `light` themes, one-click toggle for the whole palette
+- **Zoom Fade-out** - Surrounding UI (arrows/thumbnail strip/hint bar/name bar/settings menu/frame layer) fades linearly as the image zooms; fully hidden when the short edge fills its base cell; close button and backdrop never fade
+- **Aspect-ratio Adaptation** - View mode auto-downgrades by screen aspect ratio (3→2→1 pic, shrink direction only); the bottom-right menu shows/hides by fit capability
+- **Short-viewport Compact Mode** - On phone landscape (viewport height ≤480px) the thumbnail strip and settings menu shrink and the main image area grows
+- **Fullscreen Button** - A round button below Close toggles browser fullscreen
 
 ## Installation
 
@@ -375,9 +379,27 @@ To break the single-connection QoS throttling some CDNs (e.g. Cloudflare anycast
 
 Responsive window width with 150ms debounce.
 
+#### `useWindowHeight()`
+
+Responsive window height with 150ms debounce.
+
+#### `useWindowAspect()`
+
+Responsive screen aspect ratio (`innerWidth / innerHeight`), 150ms debounce, falls back to 1.6 on the SSR first frame.
+
 #### `useLazyVisibleSet(itemCount)`
 
 IntersectionObserver-based lazy loading visible set.
+
+## Responsive & Adaptive Behavior
+
+All built-in, no props required:
+
+- **Zoom fade-out**: when any active image's zoom makes its **short edge** fill the base cell (1 pic = full viewport, 2 pic = 1/2 screen, 3 pic = 1/3 screen), surrounding UI (arrows, thumbnail strip, hint bar, name bar + actions, settings menu, rename panel, frame overlay) fades linearly to fully hidden; the **close button and backdrop never fade**. Zoom only — panning is excluded.
+- **Aspect-ratio auto-downgrade**: when the viewport ratio tier (W/H ≤1 single, 1<ratio<1.5 dual, ≥1.5 triple) drops below the current view mode it auto-downgrades (manual choice is kept when the window grows; never auto-upgrades).
+- **Menu gating**: the bottom-right settings menu appears only when the ratio >1 (dual fits); the 3-pic option only when ≥1.5.
+- **Short-viewport compact mode** (height ≤480px, typically phone landscape): thumbnail strip and settings menu scale to 0.72 and bottom reservation shrinks, greatly enlarging the main image; desktop/tablet/portrait unaffected. Thumbnail density (few/med/more) is capped by actual available width.
+- **Fullscreen**: a round button below Close (icon reflects state) requests/exits browser fullscreen on `documentElement`; i18n keys `fullscreen` / `exitFullscreen` are built in (zh/en).
 
 ## Performance Optimization Strategy
 

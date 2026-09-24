@@ -23,6 +23,58 @@ export function useWindowWidth() {
   return width;
 }
 
+// ── useWindowHeight ──
+// 视口高度（CSS px），同款 150ms debounce。用于"矮视口"（手机横屏）判定：
+// 高度是区分手机横屏与电脑/平板/竖屏最可靠的单一信号，无需 UA 设备嗅探。
+export function useWindowHeight() {
+  const [height, setHeight] = useState(() =>
+    typeof window !== "undefined" ? window.innerHeight : 900
+  );
+  useEffect(() => {
+    let timerId: ReturnType<typeof setTimeout>;
+    const update = () => {
+      clearTimeout(timerId);
+      timerId = setTimeout(() => setHeight(window.innerHeight), 150);
+    };
+    window.addEventListener("resize", update);
+    return () => {
+      window.removeEventListener("resize", update);
+      clearTimeout(timerId);
+    };
+  }, []);
+  return height;
+}
+
+// ── useWindowAspect ──
+// 视口宽高比（宽 ÷ 高），与 useWindowWidth 同款 150ms  debounce。
+// 用于按屏幕比例自动收敛视图模式（单/双/三）及右下角设置菜单的出现时机。
+export function useWindowAspect() {
+  const [aspect, setAspect] = useState(() =>
+    typeof window !== "undefined" && window.innerHeight > 0
+      ? window.innerWidth / window.innerHeight
+      : 1.6
+  );
+  useEffect(() => {
+    let timerId: ReturnType<typeof setTimeout>;
+    const update = () => {
+      clearTimeout(timerId);
+      timerId = setTimeout(
+        () =>
+          setAspect(
+            window.innerHeight > 0 ? window.innerWidth / window.innerHeight : 1.6
+          ),
+        150
+      );
+    };
+    window.addEventListener("resize", update);
+    return () => {
+      window.removeEventListener("resize", update);
+      clearTimeout(timerId);
+    };
+  }, []);
+  return aspect;
+}
+
 // ── useLazyVisibleSet ──
 // 用 IntersectionObserver 追踪哪些索引进入/离开视口附近，
 // 只渲染可见区域 ± margin 的图片，大幅减少 DOM 节点数。
@@ -96,33 +148,81 @@ export function useLazyVisibleSet(itemCount: number): {
 // ── useInView ──
 // 单个元素进入/离开视口的局部检测。可见性变化只更新本组件局部 state，
 // 不触发父级/全局重渲染，适合缩略图条这类"谁可见谁加载"的场景。
+//
+// 性能：按 rootMargin 共享一个真实 IntersectionObserver 实例，而不是每个调用方各自
+// new 一个。缩略图条虚拟化窗口内有 ~41 个 ThumbnailItem 各调用一次 useInView，
+// 合并前实测删除窗口内 computeIntersections 被调用 204 次、累计 108.4ms。
+// 注：合并后复测（Trace-20260923T184733）发现 IO 总耗时基本持平（216 次/115.5ms），
+// 说明浏览器端 computeIntersections 的开销主要是按“目标数”而非“observer 实例数”计算，
+// 合并实例没有按预期降低这部分耗时（本改动保留：仍然减少了 40 个冗余 observer 对象/回调
+// 闭包的创建与销毁，属于无害的结构性改善，但不能当作已验证的性能收益看待）。
+
+const sharedObservers = new Map<
+  string,
+  { observer: IntersectionObserver; targets: Map<Element, (isIntersecting: boolean) => void> }
+>();
+
+function acquireSharedObserver(rootMargin: string) {
+  let entry = sharedObservers.get(rootMargin);
+  if (!entry) {
+    const targets = new Map<Element, (isIntersecting: boolean) => void>();
+    const observer = new IntersectionObserver(
+      (records) => {
+        for (const record of records) {
+          targets.get(record.target)?.(record.isIntersecting);
+        }
+      },
+      { rootMargin }
+    );
+    entry = { observer, targets };
+    sharedObservers.set(rootMargin, entry);
+  }
+  const { observer, targets } = entry;
+  return {
+    observe(el: Element, cb: (isIntersecting: boolean) => void) {
+      targets.set(el, cb);
+      observer.observe(el);
+    },
+    unobserve(el: Element) {
+      targets.delete(el);
+      observer.unobserve(el);
+      // 该 rootMargin 下已无观察目标时释放实例，避免长期驻留（下次调用会重新按需创建）
+      if (targets.size === 0) {
+        observer.disconnect();
+        sharedObservers.delete(rootMargin);
+      }
+    },
+  };
+}
 
 export function useInView<T extends HTMLElement = HTMLElement>(
   rootMargin = "0px"
 ): [boolean, (el: T | null) => void] {
   const [inView, setInView] = useState(false);
-  const ioRef = useRef<IntersectionObserver | null>(null);
+  const elRef = useRef<T | null>(null);
 
   const setRef = useCallback(
     (el: T | null) => {
-      if (ioRef.current) {
-        ioRef.current.disconnect();
-        ioRef.current = null;
-        setInView(false);
-      }
+      const shared = acquireSharedObserver(rootMargin);
+      if (elRef.current) shared.unobserve(elRef.current);
+      elRef.current = el;
       if (el) {
-        const obs = new IntersectionObserver(
-          (entries) => setInView(entries[0]?.isIntersecting ?? false),
-          { rootMargin }
-        );
-        ioRef.current = obs;
-        obs.observe(el);
+        shared.observe(el, (isIntersecting) => setInView(isIntersecting));
+      } else {
+        setInView(false);
       }
     },
     [rootMargin]
   );
 
-  useEffect(() => () => ioRef.current?.disconnect(), []);
+  useEffect(() => {
+    return () => {
+      if (elRef.current) {
+        acquireSharedObserver(rootMargin).unobserve(elRef.current);
+        elRef.current = null;
+      }
+    };
+  }, [rootMargin]);
 
   return [inView, setRef];
 }
