@@ -86,9 +86,12 @@ import {
   type ImageMotions,
   computeZoomTransform,
   computeContainedSize,
+  computeZoomUiOpacity,
+  RATIO_MAX_SINGLE,
+  RATIO_MAX_DUAL,
   formatFileSize,
 } from "./utils";
-import { useImagePreloader, useWindowWidth, useInView } from "./hooks";
+import { useImagePreloader, useWindowWidth, useWindowHeight, useWindowAspect, useInView } from "./hooks";
 import { useCarouselI18n, useCarouselLang } from "./i18n";
 import AnimatedSlideImg from "./AnimatedSlideImg";
 import HintBar from "./HintBar";
@@ -219,6 +222,11 @@ const carThemeStyles = `
 .car__pill{background:var(--car-pill)}
 .car__sep{background:var(--car-sep)}
 .car__nav:hover{background:var(--car-nav-hover)}
+.car__nav:active{background:var(--car-nav-hover)}
+/* 触摸屏无真 hover：点击后 :hover 会"粘住"导致区域高亮/提示气泡常驻。仅触摸设备上
+   取消 hover 表现，高亮只在按住(:active)的瞬间出现。用 !important 提高优先级以
+   覆盖 Tailwind 的 .group:hover .group-hover:opacity-100（特异性更高）。 */
+@media (hover:none){.car__nav:hover{background:transparent !important}.group:hover .car__tooltip,.car__tooltip{opacity:0 !important}}
 .car__placeholder{background:var(--car-placeholder)}
 .car__strip{background:var(--car-strip-bg)}
 `;
@@ -280,6 +288,7 @@ const MemoAnimatedSlideImg = React.memo(
     prev.deleteTranslateX === next.deleteTranslateX &&
     prev.groupShiftX === next.groupShiftX &&
     prev.groupShiftScaleX === next.groupShiftScaleX &&
+    prev.zoomScale === next.zoomScale &&
     prev.movingClipPath === next.movingClipPath &&
     prev.viewModeOffsetX === next.viewModeOffsetX &&
     prev.entryXFrom === next.entryXFrom &&
@@ -324,6 +333,14 @@ const THUMB_FLY_UP = THUMB_SIZE + 16;
  * 高亮边框仍按 viewMode 动画其自身高度（相对容器居中），不影响本行位置。
  */
 const STRIP_ROW_HEIGHT = CENTER_THUMB_SIZE + 8;
+// ── 矮视口（手机横屏）紧凑模式：缩略图条整体缩小并压缩底部预留，把高度还给主图 ──
+// 判据用"视口高度"而非 UA 设备检测：正常窗口高度 ≤480 的唯一场景就是手机横屏
+// （iPhone 横屏 360〜430px）；电脑/笔记本（≥700）、平板横屏（≥768）、手机竖屏（≥600）天然不触发。
+const STRIP_COMPACT_MAX_H = 480;
+/** 紧凑模式：底部预留 140→96（主图高 +44px） */
+const STRIP_BOTTOM_COMPACT = 96;
+/** 紧凑模式：缩略图条（含 mt-17 共 105px 流高）整体缩放比 */
+const STRIP_COMPACT_SCALE = 0.72;
 /** 吸入动画时长（ms）：被删图 canvas 网格形变吸入删除钮 */
 const DELETE_SUCTION_MS = 1400 / 3.5;
 /** 删除切换动画时长（ms）：吸入结束后右段补位平移 + 新入图入场，与常规切换(0.4s)同源同速 */
@@ -790,6 +807,10 @@ function SwiperLoopCarousel({
   const pendingRealIndexRef = useRef(0);
   const stripX = useMotionValue(0);
   const stripScale = useMotionValue(1);
+  // "放大渐隐"（单/双/三图）：由活跃行图缩放倍数推导的周边 UI 不透明度（1=默认全不透明，
+  // 任一图最短边占"基准格位"（单图=视口/双图=1/2屏/三图=1/3屏）达 100% 时=0）。仅 MotionValue
+  // 逐事件驱动、不触发 React 重渲染；共享给左右箭头/缩略图条/提示条/名称栏+操作钮/设置菜单/重命名面板/框架层。
+  const zoomUiOpacity = useMotionValue(1);
   const stripAnimRef = useRef<ReturnType<typeof animate> | null>(null);
   const stripDragRef = useRef({
     startX: 0,
@@ -1522,6 +1543,23 @@ function SwiperLoopCarousel({
       changeViewMode(maxAllowed);
     }
   }, [isOpen, n, viewMode, changeViewMode]);
+
+  // ── 按屏幕宽高比（W÷H）自动收敛视图模式（仅"缩小"方向启用）──
+  // ratio ≤ 1（竖屏/窄屏）→ 单图；1 < ratio < 1.5 → 双图；ratio ≥ 1.5 → 三图。
+  // 只在视口变小导致当前模式超出可行档位时才自动降级；视口变大不自动升级：
+  // 当前是什么视图，放大后依然是什么视图（手动选择同理由升档也不覆盖，只受降档接管）。
+  // 同一比例判定兼用于右下角设置菜单的出现：能盛放双图才出菜单，能盛放三图才出三图选项。
+  const windowAspect = useWindowAspect();
+  const canFitDual = windowAspect > RATIO_MAX_SINGLE;
+  const canFitTriple = windowAspect >= RATIO_MAX_DUAL;
+  const ratioTier: 1 | 2 | 3 = !canFitDual ? 1 : !canFitTriple ? 2 : 3;
+  useEffect(() => {
+    if (!isOpen) return;
+    // 降级复用 changeViewMode 全套过渡动画，与张数限制（n 自动收敛 effect）同模式。
+    if (ratioTier < viewMode) {
+      changeViewMode(ratioTier);
+    }
+  }, [isOpen, ratioTier, viewMode, changeViewMode]);
 
   // 导航锁定时禁用 Swiper 触摸滑动
   useEffect(() => {
@@ -2281,13 +2319,37 @@ function SwiperLoopCarousel({
   }, [realIndex, isOpen]);
 
   const windowWidth = useWindowWidth();
-  const isNarrow = windowWidth < 1024;
+  const windowHeight = useWindowHeight();
+  // 手机横屏等矮视口 → 缩略图条紧凑模式（见 STRIP_COMPACT_MAX_H 注释）
+  const compactStrip = windowHeight > 0 && windowHeight <= STRIP_COMPACT_MAX_H;
+  // ── 全屏切换：监听 fullscreenchange 同步图标；对 documentElement 请求/退出全屏 ──
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const toggleFullscreen = useCallback(() => {
+    if (typeof document === "undefined") return;
+    if (!document.fullscreenElement) {
+      document.documentElement.requestFullscreen?.().catch(() => {});
+    } else {
+      document.exitFullscreen?.().catch(() => {});
+    }
+  }, []);
+  useEffect(() => {
+    const onFsChange = () => setIsFullscreen(Boolean(document.fullscreenElement));
+    document.addEventListener("fullscreenchange", onFsChange);
+    return () => document.removeEventListener("fullscreenchange", onFsChange);
+  }, []);
   const density = STRIP_DENSITY_CONFIG[stripDensityLevel];
-  const STRIP_VISIBLE = isNarrow ? 5 : density.visible;
-  const STRIP_DRAG_VISIBLE = isNarrow ? 11 : density.drag;
+  // 可见缩略图数：不再被 isNarrow 固定为 5（那会整体忽略"少/中/多"设置），
+  // 改为按实际可用宽度封顶：宽度足够（手机横屏 844px → 封顶 12）时少/中/多全部生效；
+  // 宽度不足（手机竖屏 390px → 封顶 5）自动降档，与原窄屏行为一致。
+  const stripFitPitch = THUMB_SIZE + THUMB_GAP;
+  const maxVisibleByWidth = Math.max(3, Math.floor((windowWidth - 32) / stripFitPitch));
+  const STRIP_VISIBLE = Math.min(density.visible, maxVisibleByWidth);
+  // 拖拽态项自带缩小（STRIP_DRAG_SCALE 最低 0.4，每项约 25.6px），按缩小后的宽度封顶；
+  // 390px 竖屏下 15 项也仅 384px，正常不会触发，保兼容极端窄窗口。
+  const STRIP_DRAG_VISIBLE = Math.min(density.drag, Math.max(7, Math.floor((windowWidth - 32) / (stripFitPitch * 0.4))));
   const STRIP_VISIBLE_COUNT =
     isStripDragging && dragMoved ? STRIP_DRAG_VISIBLE : STRIP_VISIBLE;
-  const STRIP_THUMB_PITCH = THUMB_SIZE + THUMB_GAP;
+  const STRIP_THUMB_PITCH = stripFitPitch;
   const STRIP_BASE_WIDTH =
     STRIP_DRAG_VISIBLE * THUMB_SIZE + (STRIP_DRAG_VISIBLE - 1) * THUMB_GAP;
   const STRIP_BASE_X = (STRIP_BASE_WIDTH - THUMB_SIZE) / 2;
@@ -2469,15 +2531,20 @@ function SwiperLoopCarousel({
     return () => controls.stop();
   }, [isStripDragging, dragMoved, STRIP_DRAG_SCALE, stripScale]);
 
-  // 跟踪 container 宽度，用于计算每张图片在当前视图模式下的目标 X 偏移
+  // 跟踪 container 尺寸，用于计算每张图片在当前视图模式下的目标 X 偏移
+  // 【手机错位根因】必须用 offsetWidth/offsetHeight（整数，与 Swiper 内部 getOuterSize 完全同口径），
+  // 不能用 getBoundingClientRect().width（手机 DPR/小数布局下为小数）。虚拟分层的 left=index*(virtualCellW+sb)
+  // 要与 Swiper 真实 slide 节距逐像素对齐；若 containerWidth 与 Swiper 的整数 width 有 δ 偏差，则每张累积
+  // δ/vm、序号越大越往右偏移（手机才测得出，桌面宽度为整数 δ=0 故无偏移）。
   useEffect(() => {
     if (!isOpen) return;
     const el = containerRef.current;
     if (!el) return;
     const update = () => {
-      const rect = el.getBoundingClientRect();
-      if (rect.width > 0) setContainerWidth(rect.width);
-      if (rect.height > 0) setContainerHeight(rect.height);
+      const w = el.offsetWidth;
+      const h = el.offsetHeight;
+      if (w > 0) setContainerWidth(w);
+      if (h > 0) setContainerHeight(h);
     };
     update();
     const observer = new ResizeObserver(update);
@@ -2812,6 +2879,62 @@ function SwiperLoopCarousel({
     const unsubs = [m.scale, m.x, m.y].map((mv) => mv.on("change", update));
     return () => unsubs.forEach((u) => u());
   }, [isOpen, realIndex]);
+
+  // ── "放大渐隐"（单/双/三图）：订阅活跃行全部图片 scale，取最大者（任一图达标即全隐）──
+  // 计算基准随模式切换：单图以整个视口、双图以 1/2 屏幕、三图以 1/3 屏幕（宽÷viewMode，高不变）
+  // 为基准格位；任一活跃图以最短边为基准放大到与格位一致（coverage=1，完全填满其格位）时，
+  // 周边 UI 与单图同样全部隐藏。只计缩放、不计拖拽（按居中计算）；基准尺寸（scale=1 的
+  // contain 渲染尺寸）优先取 img.width/height，缺失时从 DOM 主图 naturalWidth/Height 兜底
+  // （读 natural 尺寸不触发布局）；无尺寸信息的图不参与计算。纯 MotionValue 驱动零重渲染。
+  useEffect(() => {
+    if (!isOpen || n === 0) {
+      zoomUiOpacity.set(1);
+      return;
+    }
+    // 基准格位：宽度 = 视口宽 ÷ viewMode（双图 1/2、三图 1/3），高度 = 视口高
+    const refW = window.innerWidth / viewMode;
+    const refH = window.innerHeight;
+    // 图在布局中的实际格宽（与 Swiper slidesPerView/spaceBetween 一致：双/三图间隙 8、单图 2）
+    const cellW =
+      viewMode > 1
+        ? (containerWidth - (viewMode - 1) * 8) / viewMode
+        : containerWidth;
+    const apply = () => {
+      let minOp = 1;
+      for (let off = 0; off < viewMode; off++) {
+        const idx = (realIndex + off) % n;
+        const m = imageMotionsMapRef.current.get(idx);
+        const img = images[idx];
+        if (!m || !img) continue;
+        const s = m.scale.get();
+        if (s <= 1) continue; // 未放大 → 该图 op=1，不拉低全局
+        let nw = img.width;
+        let nh = img.height;
+        if (!nw || !nh) {
+          const el = document.querySelector(
+            `[data-img-index="${idx}"] [data-carousel-main-img]`
+          ) as HTMLImageElement | null;
+          if (el && el.naturalWidth > 0) {
+            nw = el.naturalWidth;
+            nh = el.naturalHeight;
+          }
+        }
+        if (!nw || !nh || cellW <= 0 || containerHeight <= 0) continue;
+        const base = computeContainedSize(nw, nh, cellW, containerHeight);
+        const op = computeZoomUiOpacity(s, base.w, base.h, refW, refH);
+        if (op < minOp) minOp = op;
+      }
+      zoomUiOpacity.set(minOp);
+    };
+    apply();
+    // 订阅活跃行每张图的 scale：任一变化都重取 min（事件频率与滚轮/双指 rAF 节流同步）
+    const unsubs: Array<() => void> = [];
+    for (let off = 0; off < viewMode; off++) {
+      const m = imageMotionsMapRef.current.get((realIndex + off) % n);
+      if (m) unsubs.push(m.scale.on("change", apply));
+    }
+    return () => unsubs.forEach((u) => u());
+  }, [isOpen, viewMode, realIndex, n, images, containerWidth, containerHeight, zoomUiOpacity]);
   const imgOverflowActive =
     isOpen &&
     (imgDraggingIdx != null ||
@@ -2820,8 +2943,9 @@ function SwiperLoopCarousel({
   const swiperContainerStyle = {
     // 外侧黑边固定 20px（上/左/右），画布内部宽度 = 视口宽 - 两侧黑边，随屏自适应；
     // 高度贴近屏幕（顶部留 20px 黑边、底部外扩 3px）；四角圆角由 overflow-hidden + borderRadius 裁切。
+    // 矮视口（手机横屏）紧凑模式：底部预留 140→96，把高度还给主图。
     width: `calc(100vw - ${CANVAS_EDGE_PX * 2}px)`,
-    height: `calc(100dvh - ${BOTTOM_RESERVED}px - ${CANVAS_EDGE_PX}px + 3px)`,
+    height: `calc(100dvh - ${compactStrip ? STRIP_BOTTOM_COMPACT : BOTTOM_RESERVED}px - ${CANVAS_EDGE_PX}px + 3px)`,
     borderRadius: 14,
     // style 覆盖 className 的 overflow-hidden：恒定放开裁剪，图片放大/位移溢出时始终从画布边缘"透图"到
     // 半透明框架层上（松手后不退回裁剪），形成一直可见的半透明边缘。
@@ -3419,6 +3543,7 @@ function SwiperLoopCarousel({
               src={displaySrc}
               underlaySrc={img.thumbSrc}
               alt=""
+              zoomScale={motionsNow.scale}
               isActive={isActive}
               wasActive={wasActiveMap.get(index)}
               // 删除窗口内"从右侧进入的新图"（deleteEntryTarget）会被驱动同步飞入主图位置，
@@ -3481,7 +3606,7 @@ function SwiperLoopCarousel({
           {isActive && deletingId !== img.id && (
             <motion.div
               className="pointer-events-none absolute left-3 top-[calc(56px-20px)] z-10 flex items-center gap-3"
-              style={{ x: rider ? groupShiftX : 0, willChange: "transform" }}
+              style={{ x: rider ? groupShiftX : 0, willChange: "transform", opacity: zoomUiOpacity }}
             >
               {/* 名称栏：序号 / 名称 / 尺寸 / 大小。与操作按钮分开，单独成栏。幸存图重排重挂载时跳过入场淡入 */}
               <motion.div
@@ -3872,19 +3997,21 @@ function SwiperLoopCarousel({
             )}
 
             {/* 半透明"框架"边缘层：图片不做裁切，溢出部分被此半透明框覆盖而呈半透明，形成清晰边界。
-              恒定渲染（容器 overflow 恒 visible），使半透明边缘/透图一直可见而非仅在拖拽缩放时出现。 */}
-            <div
+              恒定渲染（容器 overflow 恒 visible），使半透明边缘/透图一直可见而非仅在拖拽缩放时出现。
+              单图放大渐隐：框架半透明层随周边 UI 一同变透（用户规格："包括框架的黑色半透明"）。 */}
+            <motion.div
               className="pointer-events-none absolute inset-0 z-[5]"
-              style={{ borderRadius: 14, boxShadow: "0 0 0 9999px var(--car-frame)" }}
+              style={{ borderRadius: 14, boxShadow: "0 0 0 9999px var(--car-frame)", opacity: zoomUiOpacity }}
             />
           </div>
 
-          {/* Dev 调试控制面板：仅 debugPanel 显式开启且非生产构建时渲染。外部引用默认 debugPanel=false → 面板不出现 */}
+          {/* Dev 调试控制面板：仅 debugPanel 显式开启且非生产构建时渲染。外部引用默认 debugPanel=false → 面板不出现。
+              它也是盖在图片上的半透明黑层，随单图放大渐隐一同淡出（生产构建此 JSX 整体 DCE，零开销） */}
           {isDev && debugPanel && (
-            <div
+            <motion.div
               className="absolute top-16 right-16 z-[60] select-none"
               onClick={(e) => e.stopPropagation()}
-              style={{ fontFamily: "ui-monospace, SFMono-Regular, monospace" }}
+              style={{ fontFamily: "ui-monospace, SFMono-Regular, monospace", opacity: zoomUiOpacity }}
             >
               <button
                 onClick={() => setDevPanelOpen((o) => !o)}
@@ -3937,7 +4064,7 @@ function SwiperLoopCarousel({
                   ))}
                 </div>
               )}
-            </div>
+            </motion.div>
           )}
 
           {extraOverlayContent && isOpen && extraOverlayContent({ image: images[realIndex], index: realIndex, total: totalCount, isActive: true })}
@@ -3949,10 +4076,10 @@ function SwiperLoopCarousel({
             // 居中容器负责屏幕正中央定位（motion 的 transform 会覆盖 Tailwind 的 -translate-x-1/2，
             // 因此水平/垂直居中放在此静态容器上，内层 motion 只做入场 y 动画，保证面板真正居中且可点击）。
             return (
-              <div
+              <motion.div
                 className="pointer-events-auto fixed left-1/2 top-1/2 z-[70] -translate-x-1/2 -translate-y-1/2"
                 // 显式 z-index：Tailwind arbitrary 类（z-[70]）可能未被打包，会导致面板按 DOM 顺序落到图片下方
-                style={{ zIndex: 9999 }}
+                style={{ zIndex: 9999, opacity: zoomUiOpacity }}
               >
                 <motion.div
                   initial={{ y: -10, opacity: 0 }}
@@ -3996,11 +4123,26 @@ function SwiperLoopCarousel({
                   {t.renameCancel}
                 </button>
                 </motion.div>
-              </div>
+              </motion.div>
             );
           })()}
 
-          <div className={`flex justify-center w-full ${devHideThumbs ? "hidden" : ""}`} onClick={(e) => e.stopPropagation()}>
+          {/* 缩略图条流容器：矮视口（手机横屏）紧凑模式下整体 0.72 缩放并压缩流高（内部尺寸/逻辑不变），
+              配合画布高度的底部预留 140→96，主图区域明显变大；电脑/平板/竖屏高度充足，不触发。 */}
+          <motion.div
+            className={`flex justify-center w-full ${devHideThumbs ? "hidden" : ""}`}
+            style={{
+              opacity: zoomUiOpacity,
+              ...(compactStrip
+                ? {
+                    height: Math.round((STRIP_ROW_HEIGHT + 17) * STRIP_COMPACT_SCALE),
+                    transform: `scale(${STRIP_COMPACT_SCALE})`,
+                    transformOrigin: "top center",
+                  }
+                : {}),
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
             <motion.div
               ref={stripWheelRef}
               className={`relative z-[60] mt-[17px] shrink-0 overflow-hidden ${isStripDragging && dragMoved ? "cursor-grabbing" : "cursor-grab"}`}
@@ -4040,7 +4182,7 @@ function SwiperLoopCarousel({
                 transition={{ type: "spring", stiffness: 380, damping: 30, mass: 0.8 }}
               />
             </motion.div>
-          </div>
+          </motion.div>
 
           {renderToolbar ? (
             <div onClick={(e) => e.stopPropagation()}>
@@ -4062,14 +4204,14 @@ function SwiperLoopCarousel({
           <>
           <div className="pointer-events-none fixed top-5 left-0 right-0 z-30 flex items-center" onClick={(e) => e.stopPropagation()}>
             <div className="flex-1" />
-            <div className="pointer-events-auto">
+            <motion.div className="pointer-events-auto" style={{ opacity: zoomUiOpacity }}>
               <HintBar
                 isOpen={isOpen}
                 hintLabel={t.hint}
                 hintZoomDesktop={t.hintZoomDesktop}
                 hintZoomMobile={t.hintZoomMobile}
               />
-            </div>
+            </motion.div>
             <div className="flex-1 flex items-center justify-end gap-2" style={{ paddingRight: "calc((64px - 28px) / 2)" }}>
               {extraToolbarItems}
               <button
@@ -4086,10 +4228,34 @@ function SwiperLoopCarousel({
             </div>
           </div>
 
+          {/* 全屏按钮：位于关闭按钮正下方（同右偏 18px 对齐），y 轴对齐名称栏（视口 56px）；
+              样式参照关闭按钮（car__ctrl 圆钮 + 同款 tooltip）；图标随全屏态切换。 */}
+          <button
+            onClick={(e) => { e.stopPropagation(); toggleFullscreen(); }}
+            className="fixed top-[56px] z-40 inline-flex h-7 w-7 items-center justify-center rounded-full car__ctrl sm:backdrop-blur-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--car-ring)] group"
+            style={{ right: "calc((64px - 28px) / 2)" }}
+            aria-label={isFullscreen ? t.exitFullscreen : t.fullscreen}
+          >
+            {isFullscreen ? (
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M6 2v4H2 M10 2v4h4 M10 14v-4h4 M6 14v-4H2" />
+              </svg>
+            ) : (
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M2 6V2h4 M10 2h4v4 M14 10v4h-4 M6 14H2v-4" />
+              </svg>
+            )}
+            <span className="absolute top-full mt-2 left-1/2 -translate-x-1/2 whitespace-nowrap rounded-md car__tooltip px-2.5 py-1.5 text-xs opacity-0 transition-opacity group-hover:opacity-100 pointer-events-none shadow-lg backdrop-blur-sm z-50">
+              {isFullscreen ? t.exitFullscreen : t.fullscreen}
+              <span className="absolute bottom-full left-1/2 -translate-x-1/2 border-[5px] border-transparent border-b-black/80" />
+            </span>
+          </button>
+
           {n > 1 && (
             <>
-              <button
+              <motion.button
                 type="button"
+                style={{ opacity: zoomUiOpacity }}
                 onPointerDown={isNavigationLocked ? undefined : (e) => handleButtonPress(e, "left")}
                 onPointerUp={isNavigationLocked ? undefined : (e) => handleButtonRelease(e)}
                 onPointerCancel={isNavigationLocked ? undefined : (e) => handleButtonRelease(e)}
@@ -4099,8 +4265,8 @@ function SwiperLoopCarousel({
                 aria-label={t.prev}
               >
                 <span
-                  className="flex h-10 w-10 items-center justify-center rounded-full text-lg sm:backdrop-blur-sm"
-                  style={{ backgroundColor: themeTokens.arrowBg, color: themeTokens.arrowText }}
+                  className="flex h-10 w-10 items-center justify-center text-2xl font-medium"
+                  style={{ color: themeTokens.arrowText, textShadow: "0 1px 8px rgba(0,0,0,0.55)" }}
                   aria-hidden="true"
                 >
                   ‹
@@ -4109,10 +4275,11 @@ function SwiperLoopCarousel({
                   {t.prev}
                   <span className="absolute right-full top-1/2 -translate-y-1/2 border-[5px] border-transparent border-r-black/80" />
                 </span>
-              </button>
+              </motion.button>
 
-              <div
+              <motion.div
                 className="fixed right-0 top-0 z-20 h-full w-16"
+                style={{ opacity: zoomUiOpacity }}
                 onClick={(e) => e.stopPropagation()}
               >
                 {/* 居中箭头 — 与左侧 ‹ 按钮对齐方式一致 */}
@@ -4127,8 +4294,8 @@ function SwiperLoopCarousel({
                 >
                   <div className="pointer-events-none flex h-full w-full items-center justify-center">
                     <span
-                      className="flex h-10 w-10 items-center justify-center rounded-full text-lg sm:backdrop-blur-sm"
-                  style={{ backgroundColor: themeTokens.arrowBg, color: themeTokens.arrowText }}
+                      className="flex h-10 w-10 items-center justify-center text-2xl font-medium"
+                  style={{ color: themeTokens.arrowText, textShadow: "0 1px 8px rgba(0,0,0,0.55)" }}
                       aria-hidden="true"
                     >
                   ›
@@ -4140,8 +4307,10 @@ function SwiperLoopCarousel({
                   </span>
                 </div>
 
+                {/* 右下角设置菜单：能盛放双图（宽高比 > 1）才出现（取代原固定 lg 断点） */}
+                {canFitDual && (
                 <div
-                  className="absolute bottom-6 left-1/2 z-10 -translate-x-1/2 hidden lg:flex w-[56px] flex-col items-stretch rounded-2xl p-1 sm:backdrop-blur-sm gap-1"
+                  className="absolute bottom-6 left-1/2 z-10 -translate-x-1/2 flex w-[56px] flex-col items-stretch rounded-2xl p-1 sm:backdrop-blur-sm gap-1"
                   style={{
                     backgroundColor: themeTokens.shellBg,
                     "--car-title": themeTokens.titleText,
@@ -4151,6 +4320,11 @@ function SwiperLoopCarousel({
                     "--car-pill": themeTokens.activePill,
                     "--car-sep": themeTokens.separator,
                     ...(isStripDragging ? { pointerEvents: 'none' } : {}),
+                    // 矮视口（手机横屏）紧凑：与缩略图条同步 0.72 缩放（含弹出子菜单），
+                    // inline transform 覆盖 class 的 -translate-x-1/2 故需同写；origin bottom 保持底部锚定。
+                    ...(compactStrip
+                      ? { transform: "translateX(-50%) scale(0.72)", transformOrigin: "bottom center" }
+                      : {}),
                   } as React.CSSProperties}
                   onPointerDown={(e) => e.stopPropagation()}
                   onPointerUp={(e) => e.stopPropagation()}
@@ -4183,6 +4357,8 @@ function SwiperLoopCarousel({
                           className="absolute right-full mr-2 top-0 flex flex-col items-stretch rounded-xl p-0.5 shadow-lg backdrop-blur-sm z-50 gap-px" style={{ minWidth: 56, backgroundColor: themeTokens.dropdownBg }}
                         >
                           {([1, 2, 3] as const).map((mode) => {
+                            // 盛放不下三图时"三图"选项整个不出现（非置灰）：比例足够才可见
+                            if (mode === 3 && !canFitTriple) return null;
                             const isActive = viewMode === mode;
                             const cfg = VIEW_MODE_CONFIG[mode];
                             const isDisabled = (n < 2 && mode >= 2) || (n < 3 && mode >= 3);
@@ -4336,7 +4512,8 @@ function SwiperLoopCarousel({
                     </AnimatePresence>
                   </div>
                 </div>
-              </div>
+                )}
+              </motion.div>
             </>
           )}
           </>

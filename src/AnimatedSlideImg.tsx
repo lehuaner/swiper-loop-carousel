@@ -30,6 +30,9 @@ interface AnimatedSlideImgProps {
   /** 删除窗口内、从右侧进入新末位的下一张图：做标准"切换入场"（缩放+淡入+飞入左移一格），
    *  与幸存图的左移补位、第一张飞出三者同一帧同步。 */
   deleteEntryTarget?: boolean;
+  /** 本卡外层缩放 scale motion 值（Carousel 的 motions.scale）：加载转圈在它内部会被一起缩放，
+   *  施加 1/(outer×entryScale) 反缩放使转圈屏幕尺寸恒为固定值（64px），不随图片缩放放大。 */
+  zoomScale?: import("motion/react").MotionValue<number>;
   /** 删除补位的水平平移量（px，一格槽距）。 */
   deleteTranslateX?: number;
   /** 源码级删除共享平移：被删图右侧"整段"图统一读取该 motion 值，随它平滑左移一格补位；
@@ -99,6 +102,7 @@ export default function AnimatedSlideImg({
   deleteTranslateX,
   groupShiftX,
   groupShiftScaleX,
+  zoomScale,
   movingClipPath,
   viewModeOffsetX = 0,
   entryXFrom,
@@ -119,6 +123,14 @@ export default function AnimatedSlideImg({
   const entryScale = useMotionValue(1);
   const entryOpacity = useMotionValue(1);
   const internalEntryX = useMotionValue(0);
+  // 转圈固定尺寸：spinner 同时被外层缩放（zoomScale）与本卡入场缩放（entryScale）作用，
+  // 反缩放 1/(zoomScale×entryScale) 使屏幕尺寸恒为 h-16 w-16（64px）。除零保护后退化 1。
+  const spinnerInvScale = useTransform(() => {
+    const s = zoomScale?.get() ?? 1;
+    const e = entryScale.get() || 1;
+    const p = s * e;
+    return p > 0.01 ? 1 / p : 1;
+  });
   // 外部共享水平位移：直接复用父组件传入的 motion value（与名称/功能按钮栏同源），
   // 仅在未传入时使用内部创建值，保证"不传则行为不变"。
   const entryX = entryXProp ?? internalEntryX;
@@ -622,7 +634,7 @@ export default function AnimatedSlideImg({
           className="absolute inset-0 z-10 flex items-center justify-center"
           onClick={(e) => e.stopPropagation()}
         >
-          <div className="relative h-16 w-16">
+          <motion.div className="relative h-16 w-16" style={{ scale: spinnerInvScale }}>
             <svg
               className={progressKnown ? "h-full w-full -rotate-90 drop-shadow" : "h-full w-full animate-spin drop-shadow"}
               viewBox="0 0 48 48"
@@ -641,7 +653,7 @@ export default function AnimatedSlideImg({
                 strokeDashoffset={progressKnown ? CIRCUMFERENCE * (1 - clampPct(downloadProgress) / 100) : 0}
               />
             </svg>
-          </div>
+          </motion.div>
         </div>
       )}
       <img

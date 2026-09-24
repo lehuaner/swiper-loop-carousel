@@ -23,6 +23,58 @@ export function useWindowWidth() {
   return width;
 }
 
+// ── useWindowHeight ──
+// 视口高度（CSS px），同款 150ms debounce。用于"矮视口"（手机横屏）判定：
+// 高度是区分手机横屏与电脑/平板/竖屏最可靠的单一信号，无需 UA 设备嗅探。
+export function useWindowHeight() {
+  const [height, setHeight] = useState(() =>
+    typeof window !== "undefined" ? window.innerHeight : 900
+  );
+  useEffect(() => {
+    let timerId: ReturnType<typeof setTimeout>;
+    const update = () => {
+      clearTimeout(timerId);
+      timerId = setTimeout(() => setHeight(window.innerHeight), 150);
+    };
+    window.addEventListener("resize", update);
+    return () => {
+      window.removeEventListener("resize", update);
+      clearTimeout(timerId);
+    };
+  }, []);
+  return height;
+}
+
+// ── useWindowAspect ──
+// 视口宽高比（宽 ÷ 高），与 useWindowWidth 同款 150ms  debounce。
+// 用于按屏幕比例自动收敛视图模式（单/双/三）及右下角设置菜单的出现时机。
+export function useWindowAspect() {
+  const [aspect, setAspect] = useState(() =>
+    typeof window !== "undefined" && window.innerHeight > 0
+      ? window.innerWidth / window.innerHeight
+      : 1.6
+  );
+  useEffect(() => {
+    let timerId: ReturnType<typeof setTimeout>;
+    const update = () => {
+      clearTimeout(timerId);
+      timerId = setTimeout(
+        () =>
+          setAspect(
+            window.innerHeight > 0 ? window.innerWidth / window.innerHeight : 1.6
+          ),
+        150
+      );
+    };
+    window.addEventListener("resize", update);
+    return () => {
+      window.removeEventListener("resize", update);
+      clearTimeout(timerId);
+    };
+  }, []);
+  return aspect;
+}
+
 // ── useLazyVisibleSet ──
 // 用 IntersectionObserver 追踪哪些索引进入/离开视口附近，
 // 只渲染可见区域 ± margin 的图片，大幅减少 DOM 节点数。
