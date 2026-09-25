@@ -2345,6 +2345,22 @@ function SwiperLoopCarousel({
     }
   }, [isOpen]);
   const density = STRIP_DENSITY_CONFIG[stripDensityLevel];
+  // 紧凑模式菜单下拉方向：逐按钮实测"按钮下缘距视口底的空间"，不足以容纳下拉（<56px）才向上展开，
+  // 否则保持原向下——横屏贴底时最底部按钮翻转、上部按钮不受影响，非紧凑恒向下。
+  const menuBtnRefs = {
+    viewmode: useRef<HTMLButtonElement>(null),
+    density: useRef<HTMLButtonElement>(null),
+    wheel: useRef<HTMLButtonElement>(null),
+  };
+  const dropdownUp = (key: "viewmode" | "density" | "wheel") => {
+    if (!compactStrip) return false;
+    const el = menuBtnRefs[key].current;
+    if (!el) return false;
+    // 向下展开时下拉顶边与按钮顶边对齐（top-0），能否容纳 = 视口底 - 按钮顶 vs 下拉盒高；
+    // 菜单整体已 0.72 视觉缩放，每项选项约 18px（含间隙/内边距），3 项约 54px。
+    const need = (key === "wheel" ? 2 : 3) * 18;
+    return window.innerHeight - el.getBoundingClientRect().top < need;
+  };
   // 可见缩略图数：不再被 isNarrow 固定为 5（那会整体忽略"少/中/多"设置），
   // 改为按实际可用宽度封顶：宽度足够（手机横屏 844px → 封顶 12）时少/中/多全部生效；
   // 宽度不足（手机竖屏 390px → 封顶 5）自动降档，与原窄屏行为一致。
@@ -4348,6 +4364,7 @@ function SwiperLoopCarousel({
                   {/* 视图模式 - 二级菜单 */}
                   <div className="relative" data-dropdown="viewmode">
                     <button
+                      ref={menuBtnRefs.viewmode}
                       type="button"
                       onClick={() => setOpenMenu(openMenu === "viewmode" ? null : "viewmode")}
                       className={`relative flex h-6 w-full items-center justify-center rounded-lg text-[10px] font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--car-ring)] group ${
@@ -4369,7 +4386,7 @@ function SwiperLoopCarousel({
                           animate={{ opacity: 1, scale: 1, x: 0 }}
                           exit={{ opacity: 0, scale: 0.92, x: -4 }}
                           transition={{ duration: 0.15, ease: "easeOut" }}
-                          className={`absolute right-full mr-2 ${compactStrip ? "bottom-0" : "top-0"} flex flex-col items-stretch rounded-xl p-0.5 shadow-lg backdrop-blur-sm z-50 gap-px`} style={{ minWidth: 56, backgroundColor: themeTokens.dropdownBg }}
+                          className={`absolute right-full mr-2 ${dropdownUp("viewmode") ? "bottom-0" : "top-0"} flex flex-col items-stretch rounded-xl p-0.5 shadow-lg backdrop-blur-sm z-50 gap-px`} style={{ minWidth: 56, backgroundColor: themeTokens.dropdownBg }}
                         >
                           {([1, 2, 3] as const).map((mode) => {
                             // 盛放不下三图时"三图"选项整个不出现（非置灰）：比例足够才可见
@@ -4418,6 +4435,7 @@ function SwiperLoopCarousel({
                   {/* 密度 - 二级菜单 */}
                   <div className="relative" data-dropdown="density">
                     <button
+                      ref={menuBtnRefs.density}
                       type="button"
                       onClick={() => setOpenMenu(openMenu === "density" ? null : "density")}
                       className={`relative flex h-6 w-full items-center justify-center rounded-lg text-[10px] font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--car-ring)] group cursor-pointer car__title`}
@@ -4436,7 +4454,7 @@ function SwiperLoopCarousel({
                           animate={{ opacity: 1, scale: 1, x: 0 }}
                           exit={{ opacity: 0, scale: 0.92, x: -4 }}
                           transition={{ duration: 0.15, ease: "easeOut" }}
-                          className={`absolute right-full mr-2 ${compactStrip ? "bottom-0" : "top-0"} flex flex-col items-stretch rounded-xl p-0.5 shadow-lg backdrop-blur-sm z-50 gap-px`} style={{ minWidth: 56, backgroundColor: themeTokens.dropdownBg }}
+                          className={`absolute right-full mr-2 ${dropdownUp("density") ? "bottom-0" : "top-0"} flex flex-col items-stretch rounded-xl p-0.5 shadow-lg backdrop-blur-sm z-50 gap-px`} style={{ minWidth: 56, backgroundColor: themeTokens.dropdownBg }}
                         >
                           {([1, 2, 3] as const).map((level) => {
                             const isActive = stripDensityLevel === level;
@@ -4475,6 +4493,7 @@ function SwiperLoopCarousel({
                   {/* 滚轮功能 - 二级菜单 */}
                   <div className="relative" data-dropdown="wheel">
                     <button
+                      ref={menuBtnRefs.wheel}
                       type="button"
                       onClick={() => setOpenMenu(openMenu === "wheel" ? null : "wheel")}
                       className={`relative flex h-6 w-full items-center justify-center rounded-lg text-[10px] font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--car-ring)] group cursor-pointer car__title`}
@@ -4493,7 +4512,7 @@ function SwiperLoopCarousel({
                           animate={{ opacity: 1, scale: 1, x: 0 }}
                           exit={{ opacity: 0, scale: 0.92, x: -4 }}
                           transition={{ duration: 0.15, ease: "easeOut" }}
-                          className={`absolute right-full mr-2 ${compactStrip ? "bottom-0" : "top-0"} flex flex-col items-stretch rounded-xl p-0.5 shadow-lg backdrop-blur-sm z-50 gap-px`} style={{ minWidth: 56, backgroundColor: themeTokens.dropdownBg }}
+                          className={`absolute right-full mr-2 ${dropdownUp("wheel") ? "bottom-0" : "top-0"} flex flex-col items-stretch rounded-xl p-0.5 shadow-lg backdrop-blur-sm z-50 gap-px`} style={{ minWidth: 56, backgroundColor: themeTokens.dropdownBg }}
                         >
                           {(["zoom", "switch"] as const).map((mode) => {
                             const isActive = wheelMode === mode;
