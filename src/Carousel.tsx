@@ -2337,6 +2337,13 @@ function SwiperLoopCarousel({
     document.addEventListener("fullscreenchange", onFsChange);
     return () => document.removeEventListener("fullscreenchange", onFsChange);
   }, []);
+  // 修复：全屏状态下关闭轮播（✕/ESC/点空白）后页面仍留在浏览器全屏——
+  // 关闭时若处于全屏则主动退出（中心化在 isOpen 变化上，覆盖所有关闭路径）。
+  useEffect(() => {
+    if (!isOpen && document.fullscreenElement) {
+      document.exitFullscreen?.().catch(() => {});
+    }
+  }, [isOpen]);
   const density = STRIP_DENSITY_CONFIG[stripDensityLevel];
   // 可见缩略图数：不再被 isNarrow 固定为 5（那会整体忽略"少/中/多"设置），
   // 改为按实际可用宽度封顶：宽度足够（手机横屏 844px → 封顶 12）时少/中/多全部生效；
@@ -4362,7 +4369,7 @@ function SwiperLoopCarousel({
                           animate={{ opacity: 1, scale: 1, x: 0 }}
                           exit={{ opacity: 0, scale: 0.92, x: -4 }}
                           transition={{ duration: 0.15, ease: "easeOut" }}
-                          className="absolute right-full mr-2 top-0 flex flex-col items-stretch rounded-xl p-0.5 shadow-lg backdrop-blur-sm z-50 gap-px" style={{ minWidth: 56, backgroundColor: themeTokens.dropdownBg }}
+                          className={`absolute right-full mr-2 ${compactStrip ? "bottom-0" : "top-0"} flex flex-col items-stretch rounded-xl p-0.5 shadow-lg backdrop-blur-sm z-50 gap-px`} style={{ minWidth: 56, backgroundColor: themeTokens.dropdownBg }}
                         >
                           {([1, 2, 3] as const).map((mode) => {
                             // 盛放不下三图时"三图"选项整个不出现（非置灰）：比例足够才可见
@@ -4429,7 +4436,7 @@ function SwiperLoopCarousel({
                           animate={{ opacity: 1, scale: 1, x: 0 }}
                           exit={{ opacity: 0, scale: 0.92, x: -4 }}
                           transition={{ duration: 0.15, ease: "easeOut" }}
-                          className="absolute right-full mr-2 top-0 flex flex-col items-stretch rounded-xl p-0.5 shadow-lg backdrop-blur-sm z-50 gap-px" style={{ minWidth: 56, backgroundColor: themeTokens.dropdownBg }}
+                          className={`absolute right-full mr-2 ${compactStrip ? "bottom-0" : "top-0"} flex flex-col items-stretch rounded-xl p-0.5 shadow-lg backdrop-blur-sm z-50 gap-px`} style={{ minWidth: 56, backgroundColor: themeTokens.dropdownBg }}
                         >
                           {([1, 2, 3] as const).map((level) => {
                             const isActive = stripDensityLevel === level;
@@ -4486,7 +4493,7 @@ function SwiperLoopCarousel({
                           animate={{ opacity: 1, scale: 1, x: 0 }}
                           exit={{ opacity: 0, scale: 0.92, x: -4 }}
                           transition={{ duration: 0.15, ease: "easeOut" }}
-                          className="absolute right-full mr-2 top-0 flex flex-col items-stretch rounded-xl p-0.5 shadow-lg backdrop-blur-sm z-50 gap-px" style={{ minWidth: 56, backgroundColor: themeTokens.dropdownBg }}
+                          className={`absolute right-full mr-2 ${compactStrip ? "bottom-0" : "top-0"} flex flex-col items-stretch rounded-xl p-0.5 shadow-lg backdrop-blur-sm z-50 gap-px`} style={{ minWidth: 56, backgroundColor: themeTokens.dropdownBg }}
                         >
                           {(["zoom", "switch"] as const).map((mode) => {
                             const isActive = wheelMode === mode;
