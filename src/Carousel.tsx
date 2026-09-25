@@ -4320,10 +4320,18 @@ function SwiperLoopCarousel({
                     "--car-pill": themeTokens.activePill,
                     "--car-sep": themeTokens.separator,
                     ...(isStripDragging ? { pointerEvents: 'none' } : {}),
-                    // 矮视口（手机横屏）紧凑：与缩略图条同步 0.72 缩放（含弹出子菜单），
-                    // inline transform 覆盖 class 的 -translate-x-1/2 故需同写；origin bottom 保持底部锚定。
+                    // 矮视口（手机横屏）紧凑：与缩略图条同步 0.72 缩放（含弹出子菜单）并重新锚定——
+                    // x：right:4px + 原宽 56 → 中心距右缘 32px，与顶部关闭按钮（right 18 + 半宽 14）同轴；
+                    // y：bottom 24→8，缩放后菜单顶边不越过缩略图条黑色背景带上沿（条区流高约 76px）。
                     ...(compactStrip
-                      ? { transform: "translateX(-50%) scale(0.72)", transformOrigin: "bottom center" }
+                      ? {
+                          left: "auto",
+                          right: 4,
+                          bottom: 8,
+                          translate: "none", // 解除 Tailwind v4 独立 translate 属性的 -50%（inline transform 盖不住它）
+                          transform: "scale(0.72)",
+                          transformOrigin: "center bottom", // 合法双值语法（"bottom center" 无效会落到 left bottom）
+                        }
                       : {}),
                   } as React.CSSProperties}
                   onPointerDown={(e) => e.stopPropagation()}
