@@ -19,8 +19,11 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           registry-url: 'https://registry.npmjs.org'
+
+      # Trusted Publisher（OIDC 无 token 发布）需要 npm CLI ≥ 11；Node 22 自带的 10.x 不支持
+      - run: npm install -g npm@11
 
       - run: npm ci
 
