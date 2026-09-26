@@ -8,6 +8,10 @@ import { Virtual } from "swiper/modules";
 import type { Swiper as SwiperClass } from "swiper";
 import { playSuction, warmupSuction } from "./suctionOverlay";
 
+// 模块内阴影声明：发布包不依赖 @types/node（CI 独立安装时无 node 类型，DTS 编译会报 TS2580）；
+// 仅声明用到的 NODE_ENV，运行时由消费者打包器（Next.js/webpack/vite）注入。
+declare const process: { env: { NODE_ENV?: string } };
+
 // 连续删除时，排队项没有点击事件上下文，且 DOM 已因前序删除重排；按幻灯片索引从 DOM 实时解析
 // 删除按钮中心（吸入目标）与该幻灯片主图（网格形变纹理来源）。循环/虚拟模式下同 index 可能有
 // 多份克隆，取视口内最靠近中心的删除按钮（即真实可见的那个）。
