@@ -6,6 +6,7 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch: {}
 
 jobs:
   publish:
@@ -37,7 +38,6 @@ jobs:
             echo "Version ${PKG_VER} not yet published (latest: ${PUBLISHED_VER:-none}), proceeding."
           fi
 
+      # 无 NODE_AUTH_TOKEN：走 OIDC Trusted Publisher（npm publish --provenance 自动交换临时凭据）
       - run: npm publish --provenance --access public
         if: env.skip != 'true'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
